@@ -159,30 +159,53 @@ def _verificar_consistencia(bachiller_ia: str, bachiller_oficial: dict) -> str:
 
 def _calcular_semaforo_final(cv_semaforo: str, bg: dict) -> str:
     """
-    Combina semáforo del CV con semáforo del Background.
+    Combina nivel de riesgo del CV con resultado del Background.
 
-    Reglas:
-      ROJO    — CV ya era ROJO, O tiene procesos judiciales como demandado
-      AMARILLO— CV era AMARILLO, O mintió sobre bachiller, O CV verde+BG amarillo
-      VERDE   — CV verde Y BG verde
-      GRIS    — error en BG, mantener CV semáforo
+    Niveles (de mayor a menor riesgo):
+      CRITICO    — Delitos graves detectados (homicidio, narcos, etc)
+      RECHAZAR   — CV ya era ROJO, O procesos judiciales como demandado (sin delitos graves)
+      OBSERVACION— CV era AMARILLO, O mintió sobre bachiller, O procesos como actor
+      APTO       — CV apto Y sin observaciones en background
+      SIN_DATOS  — error en BG, mantener veredicto del CV mapeado a los nuevos niveles
+
+    Compatibilidad: si el CV viene con etiqueta vieja (VERDE/AMARILLO/ROJO) la mapeamos.
     """
-    # ROJO tiene prioridad
-    if cv_semaforo == "ROJO":
-        return "ROJO"
+    # Mapeo de etiquetas viejas → nuevas (por compatibilidad con analizador.py)
+    mapa = {
+        "VERDE":    "APTO",
+        "AMARILLO": "OBSERVACION",
+        "ROJO":     "RECHAZAR",
+        "APTO":         "APTO",
+        "OBSERVACION":  "OBSERVACION",
+        "RECHAZAR":     "RECHAZAR",
+        "CRITICO":      "CRITICO",
+    }
+    cv_nivel = mapa.get((cv_semaforo or "").upper(), "OBSERVACION")
 
     satje = bg.get("satje", {})
-    if satje.get("total_demandado", 0) > 0:
-        return "ROJO"
 
+    # 1. CRITICO — delitos graves siempre ganan
+    hay_grave, _ = _tiene_delito_grave(satje)
+    if hay_grave:
+        return "CRITICO"
+
+    # 2. RECHAZAR — CV ya era rechazado, o tiene procesos como demandado
+    if cv_nivel == "RECHAZAR":
+        return "RECHAZAR"
+    if satje.get("total_demandado", 0) > 0:
+        return "RECHAZAR"
+
+    # 3. SIN_DATOS — bg con error → mantener nivel del CV
     bg_semaforo = bg.get("semaforo", "GRIS")
     if bg_semaforo == "GRIS":
-        return cv_semaforo  # sin datos suficientes, mantener veredicto de CV
+        return cv_nivel  # ya está mapeado
 
-    if cv_semaforo == "AMARILLO" or bg_semaforo == "AMARILLO":
-        return "AMARILLO"
+    # 4. OBSERVACION — cualquiera de los dos tiene observación
+    if cv_nivel == "OBSERVACION" or bg_semaforo == "AMARILLO":
+        return "OBSERVACION"
 
-    return "VERDE"
+    # 5. APTO
+    return "APTO"
 
 
 def _resumir_bachiller_oficial(b: dict) -> str:
@@ -257,7 +280,31 @@ def _enviar_alerta_telegram(nombre: str, cedula: str, delitos: list[str]) -> Non
         print(f"[telegram] no se pudo enviar alerta: {e}")
 
 
-# ── Pre-filtro de disponibilidad (sin cambios) ───────────────────────────────
+# ── Validación de cédula ecuatoriana ─────────────────────────────────────────
+
+def _cedula_valida_ec(cedula: str) -> bool:
+    """
+    Valida cédula con el algoritmo del dígito verificador del Registro Civil.
+    Evita gastar API en cédulas mal escritas o falsas.
+    """
+    if not cedula or len(cedula) != 10 or not cedula.isdigit():
+        return False
+    provincia = int(cedula[:2])
+    if not (1 <= provincia <= 24) and provincia != 30:
+        return False
+    if int(cedula[2]) >= 6:
+        return False
+    coef = [2, 1, 2, 1, 2, 1, 2, 1, 2]
+    suma = 0
+    for i, c in enumerate(cedula[:9]):
+        p = int(c) * coef[i]
+        if p >= 10:
+            p -= 9
+        suma += p
+    return ((10 - (suma % 10)) % 10) == int(cedula[9])
+
+
+# ── Pre-filtro de disponibilidad ─────────────────────────────────────────────
 
 def _normalizar(valor: str) -> str:
     return (valor or "").strip().lower()
@@ -269,7 +316,7 @@ def _pre_filtrar(body: dict) -> dict | None:
     if turnos == "no":
         razon = "No acepta turnos rotativos"
         return {
-            "semaforo": "ROJO", "puntaje": 0, "nombre": nombre,
+            "semaforo": "RECHAZAR", "puntaje": 0, "nombre": nombre,
             "telefono": body.get("telefono", "No indicado"),
             "email":    body.get("email", "No indicado"),
             "bachiller": "No evaluado",
@@ -323,10 +370,10 @@ def _procesar_cv_sync(body: dict) -> dict:
             descarte["coincide_cv"]               = "—"
             descarte["satje_resumen"]             = "—"
             escribir_candidato(spreadsheet, descarte, metadata)
-            escribir_log(spreadsheet, "OK", f"ROJO (descarte) — {nombre}",
+            escribir_log(spreadsheet, "OK", f"RECHAZAR (descarte) — {nombre}",
                          descarte["razon_semaforo"],
                          ia="Sin IA — descarte previo", costo=0.0)
-            return {"status": "ok", "semaforo": "ROJO", "nombre": nombre, "razon": razon}
+            return {"status": "ok", "semaforo": "RECHAZAR", "nombre": nombre, "razon": razon}
 
         # ── 2. Advertencias de disponibilidad ─────────────────────────────────
         advertencias_disp = _advertencias_disponibilidad(body)
@@ -354,13 +401,20 @@ def _procesar_cv_sync(body: dict) -> dict:
         # ── 6. Background Check (bachiller oficial + SATJE) ──────────────────
         bg = {"semaforo": "GRIS"}
         if cedula:
-            print(f"[{thread_id}] Consultando background para {cedula}...")
-            bg = consultar_background_sync(cedula)
-            escribir_log(spreadsheet, "INFO",
-                         f"Background: {nombre}",
-                         f"BG semáforo={bg.get('semaforo')} | "
-                         f"tiempo={bg.get('tiempo_seg', '?')}s",
-                         ia="bg-api", costo=0.003)  # estimado por consulta
+            if not _cedula_valida_ec(cedula):
+                print(f"[{thread_id}] Cédula '{cedula}' inválida (no pasa dígito verificador) — saltando bg-api")
+                escribir_log(spreadsheet, "WARN",
+                             f"Cédula inválida: {nombre}",
+                             f"'{cedula}' no pasa validación del Registro Civil — bg-api no consultado",
+                             ia="validación local", costo=0.0)
+            else:
+                print(f"[{thread_id}] Consultando background para {cedula}...")
+                bg = consultar_background_sync(cedula)
+                escribir_log(spreadsheet, "INFO",
+                             f"Background: {nombre}",
+                             f"BG semáforo={bg.get('semaforo')} | "
+                             f"tiempo={bg.get('tiempo_seg', '?')}s",
+                             ia="bg-api", costo=0.003)  # estimado por consulta
 
         # ── 7. Calcular Semáforo FINAL y agregar campos al resultado ──────────
         cv_semaforo  = resultado.get("semaforo", "AMARILLO")

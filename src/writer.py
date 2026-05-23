@@ -20,7 +20,27 @@ def _ahora() -> str:
 
 # ── Constantes visuales ───────────────────────────────────────────────────────
 
-EMOJIS = {"VERDE": "🟢", "AMARILLO": "🟡", "ROJO": "🔴"}
+EMOJIS = {
+    # Nuevos niveles de riesgo
+    "APTO":         "🟢",
+    "OBSERVACION":  "🟡",
+    "RECHAZAR":     "🔴",
+    "CRITICO":      "🚨",
+    "SIN_DATOS":    "⚪",
+    # Etiquetas viejas (compatibilidad)
+    "VERDE":        "🟢",
+    "AMARILLO":     "🟡",
+    "ROJO":         "🔴",
+    "GRIS":         "⚪",
+}
+
+# Mapeo de etiquetas viejas → nuevas (para mostrar siempre el nombre moderno)
+RENOMBRE = {
+    "VERDE":    "APTO",
+    "AMARILLO": "OBSERVACION",
+    "ROJO":     "RECHAZAR",
+    "GRIS":     "SIN_DATOS",
+}
 
 # ── Candidatos: 19 columnas (A–S) — Rediseño v5.1 ────────────────────────────
 # Reorganizadas en bloques lógicos:
@@ -118,11 +138,13 @@ CONFIG_DEFAULTS = [
 # ── Paleta de colores profesional ─────────────────────────────────────────────
 COLOR_HEADER = {"red": 0.102, "green": 0.227, "blue": 0.361}   # #1A3A5C navy
 
-# Semáforo: pasteles suaves para fondo de celda F
+# Niveles de riesgo: colores para fondo de celda F (Semáforo)
 BG_SEMAFORO = {
-    "VERDE":    {"red": 0.831, "green": 0.937, "blue": 0.875},  # #D4EFDF
-    "AMARILLO": {"red": 0.988, "green": 0.953, "blue": 0.812},  # #FCF3CF
-    "ROJO":     {"red": 0.945, "green": 0.580, "blue": 0.541},  # #F1948A
+    "APTO":        {"red": 0.831, "green": 0.937, "blue": 0.875},  # #D4EFDF verde pastel
+    "OBSERVACION": {"red": 0.988, "green": 0.953, "blue": 0.812},  # #FCF3CF amarillo pastel
+    "RECHAZAR":    {"red": 0.945, "green": 0.580, "blue": 0.541},  # #F1948A rojo visible
+    "CRITICO":     {"red": 0.573, "green": 0.169, "blue": 0.129},  # #922B21 rojo oscuro intenso
+    "SIN_DATOS":   {"red": 0.918, "green": 0.929, "blue": 0.929},  # #EAEDED gris claro
 }
 
 COLOR_TEXTO  = {"red": 0.110, "green": 0.157, "blue": 0.200}   # #1C2833
@@ -219,9 +241,10 @@ def _dashboard_request(sid: int) -> list:
     # Usar ';' como separador de argumentos (locale es_EC) y "&" para concatenar
     formula = (
         '="📊 TOTAL: "&COUNTA(B3:B)'
-        '&"     🟢 VERDES: "&COUNTIF(F3:F;"🟢 VERDE")'
-        '&"     🟡 AMARILLOS: "&COUNTIF(F3:F;"🟡 AMARILLO")'
-        '&"     🔴 ROJOS: "&COUNTIF(F3:F;"🔴 ROJO")'
+        '&"     🟢 APTOS: "&COUNTIF(F3:F;"🟢 APTO")'
+        '&"     🟡 OBSERVACIÓN: "&COUNTIF(F3:F;"🟡 OBSERVACION")'
+        '&"     🔴 RECHAZAR: "&COUNTIF(F3:F;"🔴 RECHAZAR")'
+        '&"     🚨 CRÍTICOS: "&COUNTIF(F3:F;"🚨 CRITICO")'
     )
 
     return [
@@ -265,7 +288,12 @@ def _dashboard_request(sid: int) -> list:
 def _conditional_format_requests(sid: int) -> list:
     """Reglas de formato condicional para la columna F (Semáforo)."""
     reglas = []
+    # CRITICO usa texto blanco por contraste con el rojo oscuro
+    texto_blanco = {"red": 1.0, "green": 1.0, "blue": 1.0}
     for valor, color in BG_SEMAFORO.items():
+        text_fmt = {"bold": True}
+        if valor == "CRITICO":
+            text_fmt["foregroundColor"] = texto_blanco
         reglas.append({
             "addConditionalFormatRule": {
                 "rule": {
@@ -282,7 +310,7 @@ def _conditional_format_requests(sid: int) -> list:
                         },
                         "format": {
                             "backgroundColor": color,
-                            "textFormat": {"bold": True},
+                            "textFormat": text_fmt,
                         },
                     },
                 },
@@ -564,9 +592,10 @@ def _refrescar_dashboard(spreadsheet, hoja) -> None:
         sid = hoja.id
         formula = (
             '="📊 TOTAL: "&COUNTA(B3:B)'
-            '&"     🟢 VERDES: "&COUNTIF(F3:F;"🟢 VERDE")'
-            '&"     🟡 AMARILLOS: "&COUNTIF(F3:F;"🟡 AMARILLO")'
-            '&"     🔴 ROJOS: "&COUNTIF(F3:F;"🔴 ROJO")'
+            '&"     🟢 APTOS: "&COUNTIF(F3:F;"🟢 APTO")'
+            '&"     🟡 OBSERVACIÓN: "&COUNTIF(F3:F;"🟡 OBSERVACION")'
+            '&"     🔴 RECHAZAR: "&COUNTIF(F3:F;"🔴 RECHAZAR")'
+            '&"     🚨 CRÍTICOS: "&COUNTIF(F3:F;"🚨 CRITICO")'
         )
         spreadsheet.batch_update({"requests": [{
             "updateCells": {
@@ -951,7 +980,9 @@ def escribir_candidato(spreadsheet, resultado: dict, metadata: dict = None) -> N
         metadata = {}
 
     hoja     = spreadsheet.worksheet("Candidatos")
-    semaforo = resultado.get("semaforo", "AMARILLO")
+    semaforo_raw = resultado.get("semaforo", "OBSERVACION")
+    # Renombrar etiquetas viejas (VERDE/AMARILLO/ROJO/GRIS) a nuevas
+    semaforo = RENOMBRE.get(semaforo_raw, semaforo_raw)
     emoji    = EMOJIS.get(semaforo, "⚪")
 
     nombre   = metadata.get("nombre_form")   or resultado.get("nombre",   "No indicado")
