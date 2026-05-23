@@ -558,6 +558,31 @@ def _formatear_fila_nueva(
         print(f"[writer] advertencia _formatear_fila_nueva {fila_num}: {e}")
 
 
+def _refrescar_dashboard(spreadsheet, hoja) -> None:
+    """Reescribe solo la fórmula del dashboard en A1 (idempotente, 1 API call)."""
+    try:
+        sid = hoja.id
+        formula = (
+            '="📊 TOTAL: "&COUNTA(B3:B)'
+            '&"     🟢 VERDES: "&COUNTIF(F3:F;"🟢 VERDE")'
+            '&"     🟡 AMARILLOS: "&COUNTIF(F3:F;"🟡 AMARILLO")'
+            '&"     🔴 ROJOS: "&COUNTIF(F3:F;"🔴 ROJO")'
+        )
+        spreadsheet.batch_update({"requests": [{
+            "updateCells": {
+                "rows": [{"values": [{
+                    "userEnteredValue": {"formulaValue": formula},
+                }]}],
+                "fields": "userEnteredValue",
+                "range": {"sheetId": sid,
+                          "startRowIndex": 0, "endRowIndex": 1,
+                          "startColumnIndex": 0, "endColumnIndex": 1},
+            }
+        }]})
+    except Exception as e:
+        print(f"[writer] advertencia _refrescar_dashboard: {e}")
+
+
 def _asegurar_encabezado(spreadsheet, hoja, todos: list) -> None:
     """
     Estructura esperada:
@@ -982,7 +1007,10 @@ def escribir_candidato(spreadsheet, resultado: dict, metadata: dict = None) -> N
     _colorear_fila(spreadsheet, hoja, fila_num, semaforo)
     _formatear_fila_nueva(spreadsheet, hoja, fila_num, drive_link, nota_talento)
 
-    # Asegurar formato de pestaña Configuracion (idempotente, no cuesta nada hacerlo cada vez)
+    # Refrescar dashboard (idempotente, asegura que la fórmula esté correcta)
+    _refrescar_dashboard(spreadsheet, hoja)
+
+    # Asegurar formato de pestaña Configuracion (idempotente)
     _formatear_pestana_configuracion(spreadsheet)
 
 
