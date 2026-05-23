@@ -88,7 +88,7 @@ Postulante → Google Form → Google Sheet (raw)
 | O-Q | Preguntas Entrevista, Alertas, Razón | IA |
 | R-S | CV link, Cédula | Formulario |
 | **T** | **Bachiller MinEdu** | **Background API** |
-| **U** | **Coincide CV** (✅/⚠️ MINTIÓ) | **Verificación cruzada** |
+| **U** | **Coincide CV** (✅ Verificado/⚠️ Discrepancia detectada) | **Verificación cruzada** |
 | **V** | **Procesos Judiciales** | **SATJE** |
 
 ---

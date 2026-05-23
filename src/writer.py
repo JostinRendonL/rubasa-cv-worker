@@ -540,7 +540,7 @@ def escribir_candidato(spreadsheet, resultado: dict, metadata: dict = None) -> N
     coincide_raw = resultado.get("coincide_cv", "—")
     coincide_visual = {
         "COINCIDE":   "✅ Sí",
-        "MINTIO":     "⚠️ MINTIÓ",
+        "MINTIO":     "⚠️ Discrepancia detectada",
         "NO_APLICA":  "⚪ —",
         "—":          "—",
     }.get(coincide_raw, coincide_raw)
