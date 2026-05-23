@@ -1,0 +1,485 @@
+"""
+RUBASA CV Worker v5 — Integrado con Background Checks Ecuador
+
+Flujo:
+  1. Apps Script (Google Forms) → POST /webhook
+  2. Pre-filtro de disponibilidad (turnos rotativos = No → ROJO sin gastar IA)
+  3. Descarga PDF de Drive + extrae texto/visión
+  4. Lee Configuracion del cargo (cargo, experiencia, palabras clave)
+  5. Analiza CV con IA (GPT-4o Mini / Gemini / Llama — cadena fallback)
+  6. *** NUEVO *** Background Check: bachiller oficial + SATJE judicial
+  7. Calcula Semáforo FINAL combinando CV × Background
+  8. Escribe a hoja Candidatos con 3 columnas nuevas (T, U, V)
+  9. Log en hoja Logs con costo
+
+Variables de entorno necesarias:
+  SHEET_ID            — ID del Google Sheet
+  SA_JSON             — JSON del service account (o SA_JSON_PATH al archivo)
+  OPENROUTER_API_KEY  — para GPT-4o Mini (IA principal)
+  GEMINI_API_KEY      — fallback gratis Google
+  GROQ_API_KEY        — fallback gratis Llama
+  BG_API_URL          — http://dentaklin_bg-api:8000 (red interna Docker)
+  BG_API_KEY          — clave de la Background API
+  TELEGRAM_BOT_TOKEN  — (opcional) alertas de criminales graves
+  TELEGRAM_CHAT_ID    — (opcional) chat destino
+"""
+
+import asyncio
+import os
+import io
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+import httpx
+from fastapi import FastAPI, Request, HTTPException
+from dotenv import load_dotenv
+import gspread
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+
+from src.extractor import extraer_desde_drive
+from src.analizador import analizar_cv
+from src.config_reader import leer_configuracion
+from src.writer import escribir_candidato, escribir_log
+
+load_dotenv()
+app = FastAPI(title="RUBASA CV Worker", version="5.0.0")
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+# ── Configuración Background Check API ───────────────────────────────────────
+# Por defecto apunta a la red interna de Docker (servicio bg-api en Easypanel)
+BG_API_URL = os.getenv("BG_API_URL", "http://dentaklin_bg-api:8000")
+BG_API_KEY = os.getenv("BG_API_KEY", "")
+BG_TIMEOUT = float(os.getenv("BG_API_TIMEOUT", "60"))
+
+# Lista de delitos considerados GRAVES (disparan alerta Telegram)
+DELITOS_GRAVES = [
+    "ASESINATO", "HOMICIDIO", "FEMICIDIO",
+    "DELINCUENCIA ORGANIZADA", "ASOCIACION ILICITA",
+    "VIOLACION", "ABUSO SEXUAL", "ABUSO DE MENORES",
+    "ROBO", "ROBO AGRAVADO",
+    "TRAFICO DE DROGAS", "TENENCIA DE DROGAS", "ESTUPEFACIENTES",
+    "TENENCIA DE ARMAS", "PORTE ILEGAL",
+    "SECUESTRO", "EXTORSION", "TRATA DE PERSONAS",
+]
+
+# Pool de hilos — 3 CVs en paralelo
+_pool_cvs = ThreadPoolExecutor(max_workers=3, thread_name_prefix="cv-worker")
+
+
+# ── Helpers de conexión ──────────────────────────────────────────────────────
+
+def get_creds() -> Credentials:
+    sa_json_str = os.getenv("SA_JSON")
+    if sa_json_str:
+        return Credentials.from_service_account_info(
+            json.loads(sa_json_str), scopes=SCOPES
+        )
+    return Credentials.from_service_account_file(
+        os.getenv("SA_JSON_PATH", "credentials/service_account.json"),
+        scopes=SCOPES,
+    )
+
+
+def get_spreadsheet():
+    creds = get_creds()
+    client = gspread.authorize(creds)
+    return client.open_by_key(os.getenv("SHEET_ID"))
+
+
+def descargar_pdf_drive(file_id: str, creds: Credentials) -> bytes:
+    service = build("drive", "v3", credentials=creds)
+    request = service.files().get_media(fileId=file_id)
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buffer.getvalue()
+
+
+# ── Background Check API client ──────────────────────────────────────────────
+
+def consultar_background_sync(cedula: str) -> dict:
+    """
+    Llama síncronamente a la API de background checks.
+    Retorna dict con bachiller, satje, semaforo, tiempo_seg.
+    Si falla, retorna estructura con status=ERROR.
+    """
+    if not cedula or not cedula.isdigit() or len(cedula) != 10:
+        return {
+            "semaforo":  "GRIS",
+            "bachiller": {"estado": "ERROR", "detalle": "Cédula inválida"},
+            "satje":     {"status": "ERROR", "detalle": "Cédula inválida"},
+            "error":     "cedula_invalida",
+        }
+
+    try:
+        with httpx.Client(timeout=BG_TIMEOUT) as client:
+            r = client.post(
+                f"{BG_API_URL}/consultar/completo",
+                headers={"X-API-Key": BG_API_KEY, "Content-Type": "application/json"},
+                json={"cedula": cedula},
+            )
+            r.raise_for_status()
+            return r.json()
+    except Exception as e:
+        return {
+            "semaforo":  "GRIS",
+            "bachiller": {"estado": "ERROR", "detalle": str(e)[:200]},
+            "satje":     {"status": "ERROR", "detalle": str(e)[:200]},
+            "error":     str(e)[:200],
+        }
+
+
+def _verificar_consistencia(bachiller_ia: str, bachiller_oficial: dict) -> str:
+    """
+    Compara lo que la IA leyó del CV con lo que el Ministerio confirma.
+    Retorna: 'COINCIDE' | 'MINTIO' | 'NO_APLICA'
+    """
+    estado_oficial = bachiller_oficial.get("estado")
+    if estado_oficial == "ERROR":
+        return "NO_APLICA"
+
+    tiene_titulo_oficial = bachiller_oficial.get("tiene_titulo") is True
+    ia_dice_confirmado = (bachiller_ia or "").upper() == "CONFIRMADO"
+
+    if ia_dice_confirmado and not tiene_titulo_oficial:
+        return "MINTIO"   # el CV dice bachiller pero el ministerio no lo tiene
+    if not ia_dice_confirmado and tiene_titulo_oficial:
+        return "COINCIDE"  # bonus: tiene título aunque el CV no lo dijo claro
+    return "COINCIDE"
+
+
+def _calcular_semaforo_final(cv_semaforo: str, bg: dict) -> str:
+    """
+    Combina semáforo del CV con semáforo del Background.
+
+    Reglas:
+      ROJO    — CV ya era ROJO, O tiene procesos judiciales como demandado
+      AMARILLO— CV era AMARILLO, O mintió sobre bachiller, O CV verde+BG amarillo
+      VERDE   — CV verde Y BG verde
+      GRIS    — error en BG, mantener CV semáforo
+    """
+    # ROJO tiene prioridad
+    if cv_semaforo == "ROJO":
+        return "ROJO"
+
+    satje = bg.get("satje", {})
+    if satje.get("total_demandado", 0) > 0:
+        return "ROJO"
+
+    bg_semaforo = bg.get("semaforo", "GRIS")
+    if bg_semaforo == "GRIS":
+        return cv_semaforo  # sin datos suficientes, mantener veredicto de CV
+
+    if cv_semaforo == "AMARILLO" or bg_semaforo == "AMARILLO":
+        return "AMARILLO"
+
+    return "VERDE"
+
+
+def _resumir_bachiller_oficial(b: dict) -> str:
+    """Texto compacto para la columna T."""
+    if not b or b.get("estado") == "ERROR":
+        return f"❌ Error: {b.get('detalle', 'sin datos')[:60]}"
+    if b.get("estado") == "NO_ENCONTRADO" or not b.get("tiene_titulo"):
+        return "❌ NO encontrado en Min. Educación"
+    titulo  = b.get("titulo") or ""
+    inst    = b.get("institucion") or ""
+    fecha   = (b.get("fecha_grado") or "")[:4]
+    return f"✅ {titulo} — {inst} ({fecha})".strip()
+
+
+def _resumir_satje(s: dict) -> str:
+    """Texto compacto para la columna V."""
+    if not s or s.get("status") == "ERROR":
+        return f"❌ Error: {s.get('detalle', 'sin datos')[:60]}"
+    td = s.get("total_demandado", 0)
+    ta = s.get("total_actor", 0)
+    if td == 0 and ta == 0:
+        return "✅ Sin procesos"
+    # Listar delitos como demandado (los más graves)
+    delitos = []
+    for causa in (s.get("causas_demandado") or [])[:5]:
+        d = (causa.get("delito") or "").strip()
+        if d:
+            # Acortar "144 HOMICIDIO" → "HOMICIDIO"
+            d_corto = " ".join(d.split()[1:]) if d.split()[0].isdigit() else d
+            delitos.append(d_corto[:40])
+    extra = f" (+{td - len(delitos)})" if td > len(delitos) else ""
+    if td > 0:
+        return f"🔴 {td} demandado: {' | '.join(delitos)}{extra}"
+    return f"🟡 {ta} como actor (víctima/demandante)"
+
+
+def _tiene_delito_grave(s: dict) -> tuple[bool, list[str]]:
+    """Detecta si hay delitos GRAVES → dispara alerta Telegram."""
+    graves = []
+    for causa in (s.get("causas_demandado") or []):
+        delito = (causa.get("delito") or "").upper()
+        for g in DELITOS_GRAVES:
+            if g in delito and g not in graves:
+                graves.append(g)
+    return len(graves) > 0, graves
+
+
+def _enviar_alerta_telegram(nombre: str, cedula: str, delitos: list[str]) -> None:
+    """
+    Notifica por Telegram cuando aparece un candidato con delitos graves.
+    Solo se ejecuta si TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID están configurados.
+    """
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat  = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        return
+
+    texto = (
+        "🚨 *Candidato con antecedentes graves*\n\n"
+        f"*Nombre:* {nombre}\n"
+        f"*Cédula:* `{cedula}`\n"
+        f"*Delitos detectados:* {', '.join(delitos)}\n\n"
+        "Revisar en la hoja Candidatos."
+    )
+    try:
+        httpx.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat, "text": texto, "parse_mode": "Markdown"},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[telegram] no se pudo enviar alerta: {e}")
+
+
+# ── Pre-filtro de disponibilidad (sin cambios) ───────────────────────────────
+
+def _normalizar(valor: str) -> str:
+    return (valor or "").strip().lower()
+
+
+def _pre_filtrar(body: dict) -> dict | None:
+    turnos = _normalizar(body.get("turnos_rotativos", ""))
+    nombre = body.get("nombre", "No indicado")
+    if turnos == "no":
+        razon = "No acepta turnos rotativos"
+        return {
+            "semaforo": "ROJO", "puntaje": 0, "nombre": nombre,
+            "telefono": body.get("telefono", "No indicado"),
+            "email":    body.get("email", "No indicado"),
+            "bachiller": "No evaluado",
+            "detalle_educacion": "No evaluado — descarte previo al análisis",
+            "anios_experiencia": 0,
+            "experiencia_detalle": "No evaluado — descarte previo al análisis",
+            "disponibilidad": body.get("disponibilidad_inmediata", "No indica"),
+            "movilidad": None, "nota_talento": None,
+            "resumen": "Candidato descartado automáticamente por no cumplir requisitos mínimos.",
+            "preguntas_entrevista": [],
+            "alertas": [f"🚫 DESCARTADO AUTOMÁTICAMENTE: {razon}"],
+            "razon_semaforo": f"Descarte sin análisis de IA: {razon}. Costo: $0.",
+            "_ia_utilizada": "Sin IA — descarte previo",
+            "_costo_usd": 0.0,
+        }
+    return None
+
+
+def _advertencias_disponibilidad(body: dict) -> list[str]:
+    alertas = []
+    disp_inm = _normalizar(body.get("disponibilidad_inmediata", ""))
+    fines    = _normalizar(body.get("fines_semana", ""))
+    if "notificar" in disp_inm or disp_inm == "no":
+        alertas.append("⚠️ ATENCIÓN: NO tiene disponibilidad inmediata (debe notificar a su trabajo actual)")
+    if fines == "no":
+        alertas.append("⚠️ ATENCIÓN: NO cuenta con disponibilidad para fines de semana/feriados")
+    return alertas
+
+
+# ── Procesamiento principal ──────────────────────────────────────────────────
+
+def _procesar_cv_sync(body: dict) -> dict:
+    spreadsheet = get_spreadsheet()
+    creds       = get_creds()
+    nombre      = body.get("nombre", "desconocido")
+    cedula      = body.get("cedula", "").strip()
+    file_id     = body.get("file_id")
+
+    thread_id = threading.current_thread().name
+    print(f"[{thread_id}] Iniciando CV: {nombre} ({cedula})")
+
+    try:
+        # ── 1. Pre-filtro disponibilidad ──────────────────────────────────────
+        descarte = _pre_filtrar(body)
+        if descarte:
+            razon = descarte["alertas"][0]
+            escribir_log(spreadsheet, "INFO", f"Descarte previo: {nombre}", razon)
+            metadata = _build_metadata(body, nombre)
+            # No corremos Background para descartados (ahorra dinero)
+            descarte["bachiller_oficial_resumen"] = "—"
+            descarte["coincide_cv"]               = "—"
+            descarte["satje_resumen"]             = "—"
+            escribir_candidato(spreadsheet, descarte, metadata)
+            escribir_log(spreadsheet, "OK", f"ROJO (descarte) — {nombre}",
+                         descarte["razon_semaforo"],
+                         ia="Sin IA — descarte previo", costo=0.0)
+            return {"status": "ok", "semaforo": "ROJO", "nombre": nombre, "razon": razon}
+
+        # ── 2. Advertencias de disponibilidad ─────────────────────────────────
+        advertencias_disp = _advertencias_disponibilidad(body)
+
+        # ── 3. Descargar y extraer PDF ────────────────────────────────────────
+        pdf_bytes  = descargar_pdf_drive(file_id, creds)
+        extraccion = extraer_desde_drive(file_id, creds)
+        texto      = extraccion["texto"]
+        necesita_vision = extraccion["necesita_vision"]
+        escribir_log(spreadsheet, "INFO", f"CV recibido: {nombre}",
+                     f"Páginas: {extraccion['paginas']} | "
+                     f"Modo: {'visión' if necesita_vision else 'texto'} | Hilo: {thread_id}")
+
+        # ── 4. Leer configuración del cargo ───────────────────────────────────
+        config = leer_configuracion(spreadsheet)
+
+        # ── 5. Analizar con IA ────────────────────────────────────────────────
+        resultado = analizar_cv(
+            texto=texto, config=config,
+            pdf_bytes=pdf_bytes if necesita_vision else None,
+            necesita_vision=necesita_vision,
+            spreadsheet=spreadsheet, nombre=nombre,
+        )
+
+        # ── 6. Background Check (bachiller oficial + SATJE) ──────────────────
+        bg = {"semaforo": "GRIS"}
+        if cedula:
+            print(f"[{thread_id}] Consultando background para {cedula}...")
+            bg = consultar_background_sync(cedula)
+            escribir_log(spreadsheet, "INFO",
+                         f"Background: {nombre}",
+                         f"BG semáforo={bg.get('semaforo')} | "
+                         f"tiempo={bg.get('tiempo_seg', '?')}s",
+                         ia="bg-api", costo=0.003)  # estimado por consulta
+
+        # ── 7. Calcular Semáforo FINAL y agregar campos al resultado ──────────
+        cv_semaforo  = resultado.get("semaforo", "AMARILLO")
+        bachiller_ia = resultado.get("bachiller", "")
+        bachiller_of = bg.get("bachiller", {})
+        satje        = bg.get("satje", {})
+
+        semaforo_final = _calcular_semaforo_final(cv_semaforo, bg)
+        coincide       = _verificar_consistencia(bachiller_ia, bachiller_of)
+
+        # Sobreescribir el semáforo principal con el FINAL (mom filtra por columna E)
+        resultado["semaforo"]                   = semaforo_final
+        resultado["semaforo_cv_solo"]           = cv_semaforo
+        resultado["bachiller_oficial_resumen"]  = _resumir_bachiller_oficial(bachiller_of)
+        resultado["coincide_cv"]                = coincide
+        resultado["satje_resumen"]              = _resumir_satje(satje)
+
+        # Inyectar advertencia "mintió en CV" si aplica
+        if coincide == "MINTIO":
+            resultado.setdefault("alertas", []).insert(
+                0, "🚨 INCONSISTENCIA: CV dice bachiller pero Ministerio NO lo confirma"
+            )
+
+        # Enriquecer "razón veredicto" con datos BG
+        razon_actual = resultado.get("razon_semaforo", "")
+        razon_bg     = f"BG: {resultado['bachiller_oficial_resumen']} · {resultado['satje_resumen']}"
+        resultado["razon_semaforo"] = f"{razon_actual} | {razon_bg}".strip(" |")
+
+        # ── 8. Alerta Telegram si delito grave ────────────────────────────────
+        es_grave, delitos_graves = _tiene_delito_grave(satje)
+        if es_grave:
+            resultado.setdefault("alertas", []).insert(
+                0, f"🚨 DELITOS GRAVES: {', '.join(delitos_graves)}"
+            )
+            _enviar_alerta_telegram(nombre, cedula, delitos_graves)
+
+        # ── 9. Inyectar advertencias de disponibilidad (al inicio) ────────────
+        if advertencias_disp:
+            for aviso in reversed(advertencias_disp):
+                resultado.setdefault("alertas", []).insert(0, aviso)
+
+        # ── 10. Escribir en Sheet ─────────────────────────────────────────────
+        metadata = _build_metadata(body, nombre)
+        escribir_candidato(spreadsheet, resultado, metadata)
+        escribir_log(spreadsheet, "OK",
+                     f"{semaforo_final} — {nombre}",
+                     resultado.get("razon_semaforo", ""),
+                     ia=resultado.get("_ia_utilizada", ""),
+                     costo=resultado.get("_costo_usd"))
+
+        print(f"[{thread_id}] ✅ {nombre} → FINAL: {semaforo_final} (CV: {cv_semaforo}, BG: {bg.get('semaforo')})")
+        return {"status": "ok", "semaforo": semaforo_final, "nombre": resultado.get("nombre"),
+                "cv": cv_semaforo, "bg": bg.get("semaforo")}
+
+    except Exception as e:
+        escribir_log(spreadsheet, "ERROR", f"Fallo procesando CV de {nombre}", str(e))
+        print(f"[{thread_id}] ❌ Error: {e}")
+        raise
+
+
+def _build_metadata(body: dict, nombre: str) -> dict:
+    return {
+        "nombre_form":         nombre,
+        "email_form":          body.get("email", ""),
+        "telefono_form":       body.get("telefono", ""),
+        "cedula_form":         body.get("cedula", ""),
+        "disponibilidad_form": body.get("disponibilidad_inmediata", ""),
+        "turnos_form":         body.get("turnos_rotativos", ""),
+        "fines_semana_form":   body.get("fines_semana", ""),
+        "movilidad_form":      body.get("movilidad", ""),
+        "drive_link":          body.get("drive_link", ""),
+    }
+
+
+# ── Eventos ──────────────────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def startup_event():
+    app.state.semaforo_cvs = asyncio.Semaphore(3)
+    print("🚀 RUBASA CV Worker v5 — con Background Checks integrado")
+    print(f"   BG_API_URL: {BG_API_URL}")
+    try:
+        spreadsheet = get_spreadsheet()
+        escribir_log(spreadsheet, "OK", "SISTEMA ONLINE",
+                     "CV Worker v5 — integración Background Checks activa")
+        print("✅ Conexión a Google Sheets confirmada.")
+    except Exception as e:
+        print(f"❌ Error al conectar con Google Sheets: {e}")
+
+
+# ── Endpoints ────────────────────────────────────────────────────────────────
+
+@app.get("/")
+def root():
+    return {
+        "status":  "ok",
+        "sistema": "RUBASA CV Worker v5",
+        "workers": 3,
+        "endpoints": ["/webhook", "/health"],
+        "bg_api":  BG_API_URL,
+        "descripcion": "CV Worker + Background Checks (Bachiller + SATJE)",
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "version": "5.0.0"}
+
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    body    = await request.json()
+    file_id = body.get("file_id")
+    if not file_id:
+        raise HTTPException(status_code=400, detail="Falta el campo file_id")
+
+    async with app.state.semaforo_cvs:
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(_pool_cvs, _procesar_cv_sync, body)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
