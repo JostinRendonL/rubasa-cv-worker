@@ -216,13 +216,12 @@ def _quitar_filtro_basico(spreadsheet, hoja) -> None:
 def _dashboard_request(sid: int) -> list:
     """Construye fila 1 con stats — fórmulas que cuentan candidatos por semáforo."""
     # Texto unificado en una celda merged A1:S1 con fórmula JOIN
+    # Usar ';' como separador de argumentos (locale es_EC) y "&" para concatenar
     formula = (
-        '=CONCATENATE('
-        '"📊 TOTAL: ", COUNTA(B3:B), '
-        '"     🟢 VERDES: ", COUNTIF(F3:F, "🟢 VERDE"), '
-        '"     🟡 AMARILLOS: ", COUNTIF(F3:F, "🟡 AMARILLO"), '
-        '"     🔴 ROJOS: ", COUNTIF(F3:F, "🔴 ROJO")'
-        ')'
+        '="📊 TOTAL: "&COUNTA(B3:B)'
+        '&"     🟢 VERDES: "&COUNTIF(F3:F;"🟢 VERDE")'
+        '&"     🟡 AMARILLOS: "&COUNTIF(F3:F;"🟡 AMARILLO")'
+        '&"     🔴 ROJOS: "&COUNTIF(F3:F;"🔴 ROJO")'
     )
 
     return [
