@@ -42,11 +42,11 @@ RENOMBRE = {
     "GRIS":     "SIN_DATOS",
 }
 
-# ── Candidatos: 20 columnas (A–T) — v5.3 con SETEC ──────────────────────────
+# ── Candidatos: 20 columnas (A–T) — v5.3.1: SETEC junto a otras verificaciones
 # Reorganizadas en bloques lógicos:
-#   IDENTIDAD (A-E) | VEREDICTO (F-G) | VERIFICACIONES OFICIALES (H-I) |
-#   CV (J-L) | DISPONIBILIDAD (M-N) | ANÁLISIS IA (O-R) | ARCHIVO (S) |
-#   CAPACITACIONES OFICIALES (T)
+#   IDENTIDAD (A-E) | VEREDICTO (F-G) |
+#   VERIFICACIONES OFICIALES (H-J) ← bachiller + judicial + MDT juntos |
+#   CV-IA (K-M) | DISPONIBILIDAD (N-O) | ANÁLISIS IA (P-S) | ARCHIVO (T)
 HEADERS_CANDIDATOS = [
     "Fecha/Hora",                # A
     "Nombre",                    # B
@@ -55,19 +55,19 @@ HEADERS_CANDIDATOS = [
     "Email",                     # E
     "🚦 Semáforo",               # F  ← con fondo de color
     "Razón Veredicto",           # G
-    "🎓 Bachiller (Min. Educ.)", # H  ← oficial
+    "🎓 Bachiller (Min. Educ.)", # H  ← oficial MinEdu
     "⚖️ Procesos Judiciales",    # I  ← SATJE
-    "Educación (CV)",            # J
-    "Años Exp.",                 # K
-    "Experiencia",               # L
-    "Disponibilidad",            # M
-    "Movilidad",                 # N
-    "Resumen",                   # O
-    "⭐ Potencial",              # P
-    "Preguntas Entrevista",      # Q
-    "Alertas",                   # R
-    "📎 CV",                     # S
-    "🎖️ Certificaciones MDT",   # T  ← SETEC (Min. Trabajo)
+    "🎖️ Certificaciones MDT",   # J  ← SETEC (Min. Trabajo) ← junto a las otras
+    "Educación (CV)",            # K
+    "Años Exp.",                 # L
+    "Experiencia",               # M
+    "Disponibilidad",            # N
+    "Movilidad",                 # O
+    "Resumen",                   # P
+    "⭐ Potencial",              # Q
+    "Preguntas Entrevista",      # R
+    "Alertas",                   # S
+    "📎 CV",                     # T  ← archivo al final
 ]
 
 ANCHOS_COLUMNAS = [
@@ -80,31 +80,31 @@ ANCHOS_COLUMNAS = [
     280,  # G  Razón Veredicto (wrap)
     260,  # H  Bachiller (Min. Educ.) (wrap)
     280,  # I  Procesos Judiciales (wrap)
-    240,  # J  Educación CV (wrap)
-     75,  # K  Años Exp.
-    280,  # L  Experiencia (wrap)
-    170,  # M  Disponibilidad (wrap)
-     85,  # N  Movilidad
-    320,  # O  Resumen (wrap)
-    280,  # P  ⭐ Potencial (wrap)
-    320,  # Q  Preguntas Entrevista (wrap)
-    240,  # R  Alertas (wrap)
-     80,  # S  📎 CV (hyperlink)
-    320,  # T  🎖️ Certificaciones MDT (wrap, listas largas)
+    320,  # J  🎖️ Certificaciones MDT (wrap, listas largas)
+    240,  # K  Educación CV (wrap)
+     75,  # L  Años Exp.
+    280,  # M  Experiencia (wrap)
+    170,  # N  Disponibilidad (wrap)
+     85,  # O  Movilidad
+    320,  # P  Resumen (wrap)
+    280,  # Q  ⭐ Potencial (wrap)
+    320,  # R  Preguntas Entrevista (wrap)
+    240,  # S  Alertas (wrap)
+     80,  # T  📎 CV (hyperlink)
 ]
 
 # Índices basados en 0
-COLS_WRAP   = [6, 7, 8, 9, 11, 12, 14, 15, 16, 17, 19]  # G, H, I, J, L, M, O, P, Q, R, T
-COLS_CENTER = [5, 10, 13, 18]                            # F, K, N, S
+COLS_WRAP   = [6, 7, 8, 9, 10, 12, 13, 15, 16, 17, 18]   # G, H, I, J, K, M, N, P, Q, R, S
+COLS_CENTER = [5, 11, 14, 19]                             # F, L, O, T
 
 NUM_COLS = len(HEADERS_CANDIDATOS)        # 20
 COL_FIN  = chr(ord("A") + NUM_COLS - 1)   # "T"
 
 # Índices clave (basados en 0)
 IDX_SEMAFORO     = 5    # F
-IDX_POTENCIAL    = 15   # P
-IDX_CV_LINK      = 18   # S
-IDX_SETEC        = 19   # T
+IDX_SETEC        = 9    # J  ← junto a verificaciones oficiales
+IDX_POTENCIAL    = 16   # Q  ← shift +1
+IDX_CV_LINK      = 19   # T  ← shift +1, archivo al final
 
 # ── Logs: 6 columnas (A–F) ───────────────────────────────────────────────────
 HEADERS_LOGS  = ["Fecha/Hora", "Nivel", "Evento", "Detalle", "IA Utilizada", "Costo USD"]
@@ -627,11 +627,11 @@ def _asegurar_encabezado(spreadsheet, hoja, todos: list) -> None:
     fila1 = todos[0] if len(todos) >= 1 else []
     fila2 = todos[1] if len(todos) >= 2 else []
 
+    # Comparación EXACTA contra HEADERS_CANDIDATOS — detecta tanto diferencias
+    # de cantidad como de orden/nombre (ej. si se reordenó la columna SETEC).
     headers_ok = (
-        len(fila2) == NUM_COLS                # ← cantidad EXACTA: si difiere, fuerza reset
-        and fila2[0] == "Fecha/Hora"
-        and fila2[1] == "Nombre"
-        and fila2[2] == "Cédula"
+        len(fila2) == NUM_COLS
+        and list(fila2[:NUM_COLS]) == HEADERS_CANDIDATOS
     )
 
     if headers_ok:
@@ -1008,7 +1008,7 @@ def escribir_candidato(spreadsheet, resultado: dict, metadata: dict = None) -> N
     nota_talento   = resultado.get("nota_talento") or ""
     disponibilidad = _formatear_disponibilidad(metadata)
 
-    # Nueva estructura de 20 columnas (v5.3 con SETEC)
+    # Estructura de 20 columnas (v5.3.1: SETEC en J junto a verificaciones, CV al final en T)
     fila = [
         _ahora(),                                          # A  Fecha/Hora
         nombre,                                            # B  Nombre
@@ -1019,17 +1019,17 @@ def escribir_candidato(spreadsheet, resultado: dict, metadata: dict = None) -> N
         resultado.get("razon_semaforo", ""),               # G  Razón Veredicto
         resultado.get("bachiller_oficial_resumen", "—"),   # H  🎓 Bachiller MinEdu
         resultado.get("satje_resumen", "—"),               # I  ⚖️ Procesos Judiciales
-        resultado.get("detalle_educacion", ""),            # J  Educación (CV)
-        resultado.get("anios_experiencia", 0),             # K  Años Exp.
-        resultado.get("experiencia_detalle", ""),          # L  Experiencia
-        disponibilidad,                                    # M  Disponibilidad
-        movilidad_str,                                     # N  Movilidad
-        resultado.get("resumen", ""),                      # O  Resumen
-        nota_talento,                                      # P  ⭐ Potencial
-        preguntas,                                         # Q  Preguntas Entrevista
-        alertas,                                           # R  Alertas
-        drive_link,                                        # S  📎 CV (se reemplaza por hyperlink)
-        resultado.get("setec_resumen", "—"),               # T  🎖️ Certificaciones MDT
+        resultado.get("setec_resumen", "—"),               # J  🎖️ Certificaciones MDT
+        resultado.get("detalle_educacion", ""),            # K  Educación (CV)
+        resultado.get("anios_experiencia", 0),             # L  Años Exp.
+        resultado.get("experiencia_detalle", ""),          # M  Experiencia
+        disponibilidad,                                    # N  Disponibilidad
+        movilidad_str,                                     # O  Movilidad
+        resultado.get("resumen", ""),                      # P  Resumen
+        nota_talento,                                      # Q  ⭐ Potencial
+        preguntas,                                         # R  Preguntas Entrevista
+        alertas,                                           # S  Alertas
+        drive_link,                                        # T  📎 CV (se reemplaza por hyperlink)
     ]
 
     # ── Sección crítica: encabezado + append + número de fila ────────────────

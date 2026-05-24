@@ -45,7 +45,7 @@ from src.config_reader import leer_configuracion
 from src.writer import escribir_candidato, escribir_log
 
 load_dotenv()
-app = FastAPI(title="RUBASA CV Worker", version="5.3.0")
+app = FastAPI(title="RUBASA CV Worker", version="5.3.1")
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
