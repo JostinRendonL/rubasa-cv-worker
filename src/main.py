@@ -45,7 +45,7 @@ from src.config_reader import leer_configuracion
 from src.writer import escribir_candidato, escribir_log
 
 load_dotenv()
-app = FastAPI(title="RUBASA CV Worker", version="5.0.0")
+app = FastAPI(title="RUBASA CV Worker", version="5.3.0")
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -136,6 +136,54 @@ def consultar_background_sync(cedula: str) -> dict:
             "satje":     {"status": "ERROR", "detalle": str(e)[:200]},
             "error":     str(e)[:200],
         }
+
+
+# ── SETEC API client ─────────────────────────────────────────────────────────
+
+def consultar_setec_sync(cedula: str) -> dict:
+    """
+    Llama síncronamente al endpoint /consultar/setec del bg-api.
+    Retorna dict con tiene_certificados, detalle_cursos, total_cursos, nombre.
+    Si falla, retorna estructura con error y tiene_certificados=False.
+    """
+    if not cedula or not cedula.isdigit() or len(cedula) != 10:
+        return {
+            "error":              "Cédula inválida",
+            "tiene_certificados": False,
+            "detalle_cursos":     "Sin registros",
+            "total_cursos":       0,
+        }
+    try:
+        with httpx.Client(timeout=BG_TIMEOUT) as client:
+            r = client.post(
+                f"{BG_API_URL}/consultar/setec",
+                headers={"X-API-Key": BG_API_KEY, "Content-Type": "application/json"},
+                json={"cedula": cedula},
+            )
+            r.raise_for_status()
+            return r.json()
+    except Exception as e:
+        return {
+            "error":              str(e)[:200],
+            "tiene_certificados": False,
+            "detalle_cursos":     "Sin registros",
+            "total_cursos":       0,
+        }
+
+
+def _resumir_setec(st: dict) -> str:
+    """Texto compacto para la columna T (Certificaciones MDT)."""
+    if not st:
+        return "—"
+    if st.get("error"):
+        return f"❌ Error: {st['error'][:60]}"
+    if st.get("tiene_certificados"):
+        cursos = (st.get("detalle_cursos") or "").strip()
+        total  = st.get("total_cursos", 0)
+        if total and cursos:
+            return f"✅ {total} cert.: {cursos}"
+        return cursos or "Sin registros"
+    return "Sin registros"
 
 
 def _verificar_consistencia(bachiller_ia: str, bachiller_oficial: dict) -> str:
@@ -365,10 +413,11 @@ def _procesar_cv_sync(body: dict) -> dict:
             razon = descarte["alertas"][0]
             escribir_log(spreadsheet, "INFO", f"Descarte previo: {nombre}", razon)
             metadata = _build_metadata(body, nombre)
-            # No corremos Background para descartados (ahorra dinero)
+            # No corremos Background ni SETEC para descartados (ahorra dinero)
             descarte["bachiller_oficial_resumen"] = "—"
             descarte["coincide_cv"]               = "—"
             descarte["satje_resumen"]             = "—"
+            descarte["setec_resumen"]             = "—"
             escribir_candidato(spreadsheet, descarte, metadata)
             escribir_log(spreadsheet, "OK", f"RECHAZAR (descarte) — {nombre}",
                          descarte["razon_semaforo"],
@@ -398,23 +447,33 @@ def _procesar_cv_sync(body: dict) -> dict:
             spreadsheet=spreadsheet, nombre=nombre,
         )
 
-        # ── 6. Background Check (bachiller oficial + SATJE) ──────────────────
-        bg = {"semaforo": "GRIS"}
+        # ── 6. Background Check + SETEC EN PARALELO ───────────────────────────
+        # Ambas son llamadas HTTP independientes al bg-api. SETEC tarda ~20-60s
+        # (Playwright). Si las hacemos en serie, sumamos tiempos. ThreadPoolExecutor
+        # local de 2 workers para correrlas concurrentemente.
+        bg    = {"semaforo": "GRIS"}
+        setec = {}
         if cedula:
             if not _cedula_valida_ec(cedula):
-                print(f"[{thread_id}] Cédula '{cedula}' inválida (no pasa dígito verificador) — saltando bg-api")
+                print(f"[{thread_id}] Cédula '{cedula}' inválida (no pasa dígito verificador) — saltando bg-api+SETEC")
                 escribir_log(spreadsheet, "WARN",
                              f"Cédula inválida: {nombre}",
-                             f"'{cedula}' no pasa validación del Registro Civil — bg-api no consultado",
+                             f"'{cedula}' no pasa validación del Registro Civil — bg-api+SETEC no consultados",
                              ia="validación local", costo=0.0)
             else:
-                print(f"[{thread_id}] Consultando background para {cedula}...")
-                bg = consultar_background_sync(cedula)
+                print(f"[{thread_id}] Consultando background + SETEC en paralelo para {cedula}...")
+                with ThreadPoolExecutor(max_workers=2, thread_name_prefix=f"bg-{cedula[:4]}") as ex:
+                    f_bg    = ex.submit(consultar_background_sync, cedula)
+                    f_setec = ex.submit(consultar_setec_sync, cedula)
+                    bg    = f_bg.result()
+                    setec = f_setec.result()
+                setec_status = "OK" if setec.get("tiene_certificados") else ("ERROR" if setec.get("error") else "sin")
                 escribir_log(spreadsheet, "INFO",
-                             f"Background: {nombre}",
+                             f"Background+SETEC: {nombre}",
                              f"BG semáforo={bg.get('semaforo')} | "
-                             f"tiempo={bg.get('tiempo_seg', '?')}s",
-                             ia="bg-api", costo=0.003)  # estimado por consulta
+                             f"SETEC={setec_status} ({setec.get('total_cursos', 0)} cert.) | "
+                             f"tiempo BG={bg.get('tiempo_seg', '?')}s",
+                             ia="bg-api", costo=0.005)  # 2 llamadas en paralelo
 
         # ── 7. Calcular Semáforo FINAL y agregar campos al resultado ──────────
         cv_semaforo  = resultado.get("semaforo", "AMARILLO")
@@ -431,6 +490,7 @@ def _procesar_cv_sync(body: dict) -> dict:
         resultado["bachiller_oficial_resumen"]  = _resumir_bachiller_oficial(bachiller_of)
         resultado["coincide_cv"]                = coincide
         resultado["satje_resumen"]              = _resumir_satje(satje)
+        resultado["setec_resumen"]              = _resumir_setec(setec)
 
         # Inyectar advertencia "mintió en CV" si aplica
         if coincide == "MINTIO":

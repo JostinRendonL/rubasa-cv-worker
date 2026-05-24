@@ -42,10 +42,11 @@ RENOMBRE = {
     "GRIS":     "SIN_DATOS",
 }
 
-# ── Candidatos: 19 columnas (A–S) — Rediseño v5.1 ────────────────────────────
+# ── Candidatos: 20 columnas (A–T) — v5.3 con SETEC ──────────────────────────
 # Reorganizadas en bloques lógicos:
 #   IDENTIDAD (A-E) | VEREDICTO (F-G) | VERIFICACIONES OFICIALES (H-I) |
-#   CV (J-L) | DISPONIBILIDAD (M-N) | ANÁLISIS IA (O-R) | ARCHIVO (S)
+#   CV (J-L) | DISPONIBILIDAD (M-N) | ANÁLISIS IA (O-R) | ARCHIVO (S) |
+#   CAPACITACIONES OFICIALES (T)
 HEADERS_CANDIDATOS = [
     "Fecha/Hora",                # A
     "Nombre",                    # B
@@ -66,6 +67,7 @@ HEADERS_CANDIDATOS = [
     "Preguntas Entrevista",      # Q
     "Alertas",                   # R
     "📎 CV",                     # S
+    "🎖️ Certificaciones MDT",   # T  ← SETEC (Min. Trabajo)
 ]
 
 ANCHOS_COLUMNAS = [
@@ -88,19 +90,21 @@ ANCHOS_COLUMNAS = [
     320,  # Q  Preguntas Entrevista (wrap)
     240,  # R  Alertas (wrap)
      80,  # S  📎 CV (hyperlink)
+    320,  # T  🎖️ Certificaciones MDT (wrap, listas largas)
 ]
 
 # Índices basados en 0
-COLS_WRAP   = [6, 7, 8, 9, 11, 12, 14, 15, 16, 17]  # G, H, I, J, L, M, O, P, Q, R
-COLS_CENTER = [5, 10, 13, 18]                       # F, K, N, S
+COLS_WRAP   = [6, 7, 8, 9, 11, 12, 14, 15, 16, 17, 19]  # G, H, I, J, L, M, O, P, Q, R, T
+COLS_CENTER = [5, 10, 13, 18]                            # F, K, N, S
 
-NUM_COLS = len(HEADERS_CANDIDATOS)        # 19
-COL_FIN  = chr(ord("A") + NUM_COLS - 1)   # "S"
+NUM_COLS = len(HEADERS_CANDIDATOS)        # 20
+COL_FIN  = chr(ord("A") + NUM_COLS - 1)   # "T"
 
 # Índices clave (basados en 0)
 IDX_SEMAFORO     = 5    # F
 IDX_POTENCIAL    = 15   # P
 IDX_CV_LINK      = 18   # S
+IDX_SETEC        = 19   # T
 
 # ── Logs: 6 columnas (A–F) ───────────────────────────────────────────────────
 HEADERS_LOGS  = ["Fecha/Hora", "Nivel", "Evento", "Detalle", "IA Utilizada", "Costo USD"]
@@ -624,7 +628,7 @@ def _asegurar_encabezado(spreadsheet, hoja, todos: list) -> None:
     fila2 = todos[1] if len(todos) >= 2 else []
 
     headers_ok = (
-        len(fila2) >= NUM_COLS
+        len(fila2) == NUM_COLS                # ← cantidad EXACTA: si difiere, fuerza reset
         and fila2[0] == "Fecha/Hora"
         and fila2[1] == "Nombre"
         and fila2[2] == "Cédula"
@@ -1004,7 +1008,7 @@ def escribir_candidato(spreadsheet, resultado: dict, metadata: dict = None) -> N
     nota_talento   = resultado.get("nota_talento") or ""
     disponibilidad = _formatear_disponibilidad(metadata)
 
-    # Nueva estructura de 19 columnas
+    # Nueva estructura de 20 columnas (v5.3 con SETEC)
     fila = [
         _ahora(),                                          # A  Fecha/Hora
         nombre,                                            # B  Nombre
@@ -1025,6 +1029,7 @@ def escribir_candidato(spreadsheet, resultado: dict, metadata: dict = None) -> N
         preguntas,                                         # Q  Preguntas Entrevista
         alertas,                                           # R  Alertas
         drive_link,                                        # S  📎 CV (se reemplaza por hyperlink)
+        resultado.get("setec_resumen", "—"),               # T  🎖️ Certificaciones MDT
     ]
 
     # ── Sección crítica: encabezado + append + número de fila ────────────────
