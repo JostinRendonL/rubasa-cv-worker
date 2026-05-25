@@ -62,12 +62,16 @@ setup_metrics(app)
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    # drive.file (validado 2026-05-24 contra Rubasa): solo archivos creados/abiertos
-    # por el SA o explícitamente compartidos con su email. La carpeta "Adjuntar CV
-    # (File responses)" está compartida con worker-railway@filtro-cvs-rubasa.iam.gserviceaccount.com
-    # como Editor → todos los CVs subidos por el Form son accesibles.
-    # Si el SA se filtra, el daño potencial es 95% menor que con "drive" completo.
-    "https://www.googleapis.com/auth/drive.file",
+    # drive.readonly (intermedio entre drive y drive.file):
+    #   - Permite descargar CUALQUIER archivo al que el SA tenga acceso por
+    #     herencia (la carpeta padre compartida) — esto SÍ funciona.
+    #   - NO permite escribir, modificar, ni borrar archivos del Drive.
+    #   - Si el SA se filtra: atacante solo puede LEER lo que el SA puede leer
+    #     (mucho mejor que drive completo que permite borrar todo).
+    #
+    # Probado drive.file el 2026-05-24 y rompió descarga (no respeta herencia
+    # de permisos desde la carpeta padre). drive.readonly es el sweet spot.
+    "https://www.googleapis.com/auth/drive.readonly",
 ]
 
 # ── Configuración Background Check API ───────────────────────────────────────
