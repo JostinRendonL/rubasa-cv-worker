@@ -48,6 +48,9 @@ from src.extractor import extraer_desde_drive
 from src.analizador import analizar_cv
 from src.config_reader import leer_configuracion, obtener_delitos_graves
 from src.writer import escribir_candidato, escribir_log
+from src.vacantes import (
+    validar_slug, nombre_hoja_config, etiqueta_legible,
+)
 from src.obs import init_sentry, capture_exception
 from src.metrics import setup_metrics
 
@@ -55,7 +58,7 @@ load_dotenv()
 # Inicializar Sentry (opt-in con SENTRY_DSN) — antes de crear FastAPI
 init_sentry(servicio="cv-worker")
 
-app = FastAPI(title="RUBASA CV Worker", version="5.5.1")
+app = FastAPI(title="RUBASA CV Worker", version="5.6.0")
 
 # Métricas Prometheus opt-in (si METRICS_ENABLED=1)
 setup_metrics(app)
@@ -154,6 +157,10 @@ class WebhookPayload(BaseModel):
     fines_semana:             str = ""
     movilidad:                str = ""
     drive_link:               str = ""
+
+    # Multi-vacante (v5.6+): el Apps Script de cada Form envía su slug.
+    # Si está vacío → fallback al sistema mono-vacante (hojas Candidatos / Configuracion).
+    vacante:                  str = ""
 
     # Permitir campos extra sin fallar (Forms puede mandar más cosas en el futuro)
     model_config = {"extra": "allow"}
@@ -377,7 +384,8 @@ def _verificar_consistencia(bachiller_ia: str, bachiller_oficial: dict) -> str:
     return "COINCIDE"
 
 
-def _calcular_semaforo_final(cv_semaforo: str, bg: dict, spreadsheet=None) -> str:
+def _calcular_semaforo_final(cv_semaforo: str, bg: dict, spreadsheet=None,
+                              config_tab: str = "Configuracion") -> str:
     """
     Combina nivel de riesgo del CV con resultado del Background.
 
@@ -405,7 +413,7 @@ def _calcular_semaforo_final(cv_semaforo: str, bg: dict, spreadsheet=None) -> st
     satje = bg.get("satje", {})
 
     # 1. CRITICO — delitos graves siempre ganan
-    hay_grave, _ = _tiene_delito_grave(satje, spreadsheet)
+    hay_grave, _ = _tiene_delito_grave(satje, spreadsheet, config_tab)
     if hay_grave:
         return "CRITICO"
 
@@ -470,14 +478,14 @@ def _resumir_satje(s: dict) -> str:
     return f"🟡 {ta} como actor (víctima/demandante)"
 
 
-def _tiene_delito_grave(s: dict, spreadsheet=None) -> tuple[bool, list[str]]:
+def _tiene_delito_grave(s: dict, spreadsheet=None, config_tab: str = "Configuracion") -> tuple[bool, list[str]]:
     """
     Detecta si hay delitos GRAVES → dispara alerta Telegram.
-    La lista se lee dinámicamente de la Sheet (configurable por cliente),
+    La lista se lee dinámicamente de la Sheet (configurable por cliente y vacante),
     con fallback a DELITOS_GRAVES_FALLBACK si no hay Sheet disponible.
     """
     try:
-        lista = obtener_delitos_graves(spreadsheet) if spreadsheet else DELITOS_GRAVES_FALLBACK
+        lista = obtener_delitos_graves(spreadsheet, config_tab) if spreadsheet else DELITOS_GRAVES_FALLBACK
     except Exception:
         lista = DELITOS_GRAVES_FALLBACK
 
@@ -592,26 +600,34 @@ def _procesar_cv_sync(body: dict) -> dict:
     cedula      = body.get("cedula", "").strip()
     file_id     = body.get("file_id")
 
+    # ── Multi-vacante v5.6: identificar la vacante del payload ───────────────
+    vacante_slug = validar_slug(body.get("vacante", ""))
+    config_tab   = nombre_hoja_config(vacante_slug)
+
     thread_id = threading.current_thread().name
-    print(f"[{thread_id}] Iniciando CV: {nombre} ({cedula})")
+    vac_label = etiqueta_legible(vacante_slug)
+    print(f"[{thread_id}] Iniciando CV: {nombre} ({cedula}) · vacante={vac_label}")
 
     try:
         # ── 1. Pre-filtro disponibilidad ──────────────────────────────────────
         descarte = _pre_filtrar(body)
         if descarte:
             razon = descarte["alertas"][0]
-            escribir_log(spreadsheet, "INFO", f"Descarte previo: {nombre}", razon)
+            escribir_log(spreadsheet, "INFO", f"Descarte previo: {nombre}", razon,
+                         vacante=vacante_slug)
             metadata = _build_metadata(body, nombre)
             # No corremos Background ni SETEC para descartados (ahorra dinero)
             descarte["bachiller_oficial_resumen"] = "—"
             descarte["coincide_cv"]               = "—"
             descarte["satje_resumen"]             = "—"
             descarte["setec_resumen"]             = "—"
-            escribir_candidato(spreadsheet, descarte, metadata)
+            escribir_candidato(spreadsheet, descarte, metadata, vacante=vacante_slug)
             escribir_log(spreadsheet, "OK", f"RECHAZAR (descarte) — {nombre}",
                          descarte["razon_semaforo"],
-                         ia="Sin IA — descarte previo", costo=0.0)
-            return {"status": "ok", "semaforo": "RECHAZAR", "nombre": nombre, "razon": razon}
+                         ia="Sin IA — descarte previo", costo=0.0,
+                         vacante=vacante_slug)
+            return {"status": "ok", "semaforo": "RECHAZAR", "nombre": nombre,
+                    "razon": razon, "vacante": vacante_slug}
 
         # ── 2. Advertencias de disponibilidad ─────────────────────────────────
         advertencias_disp = _advertencias_disponibilidad(body)
@@ -623,10 +639,11 @@ def _procesar_cv_sync(body: dict) -> dict:
         necesita_vision = extraccion["necesita_vision"]
         escribir_log(spreadsheet, "INFO", f"CV recibido: {nombre}",
                      f"Páginas: {extraccion['paginas']} | "
-                     f"Modo: {'visión' if necesita_vision else 'texto'} | Hilo: {thread_id}")
+                     f"Modo: {'visión' if necesita_vision else 'texto'} | Hilo: {thread_id}",
+                     vacante=vacante_slug)
 
-        # ── 4. Leer configuración del cargo ───────────────────────────────────
-        config = leer_configuracion(spreadsheet)
+        # ── 4. Leer configuración del cargo (por vacante con fallback) ────────
+        config = leer_configuracion(spreadsheet, config_tab)
 
         # ── 5. Analizar con IA ────────────────────────────────────────────────
         resultado = analizar_cv(
@@ -648,7 +665,8 @@ def _procesar_cv_sync(body: dict) -> dict:
                 escribir_log(spreadsheet, "WARN",
                              f"Cédula inválida: {nombre}",
                              f"'{cedula}' no pasa validación del Registro Civil — bg-api+SETEC no consultados",
-                             ia="validación local", costo=0.0)
+                             ia="validación local", costo=0.0,
+                             vacante=vacante_slug)
             else:
                 print(f"[{thread_id}] Consultando background + SETEC en paralelo para {cedula}...")
                 with ThreadPoolExecutor(max_workers=2, thread_name_prefix=f"bg-{cedula[:4]}") as ex:
@@ -662,7 +680,8 @@ def _procesar_cv_sync(body: dict) -> dict:
                              f"BG semáforo={bg.get('semaforo')} | "
                              f"SETEC={setec_status} ({setec.get('total_cursos', 0)} cert.) | "
                              f"tiempo BG={bg.get('tiempo_seg', '?')}s",
-                             ia="bg-api", costo=0.005)  # 2 llamadas en paralelo
+                             ia="bg-api", costo=0.005,
+                             vacante=vacante_slug)
 
         # ── 7. Calcular Semáforo FINAL y agregar campos al resultado ──────────
         cv_semaforo  = resultado.get("semaforo", "AMARILLO")
@@ -670,7 +689,7 @@ def _procesar_cv_sync(body: dict) -> dict:
         bachiller_of = bg.get("bachiller", {})
         satje        = bg.get("satje", {})
 
-        semaforo_final = _calcular_semaforo_final(cv_semaforo, bg, spreadsheet)
+        semaforo_final = _calcular_semaforo_final(cv_semaforo, bg, spreadsheet, config_tab)
         coincide       = _verificar_consistencia(bachiller_ia, bachiller_of)
 
         # Sobreescribir el semáforo principal con el FINAL (mom filtra por columna E)
@@ -693,7 +712,7 @@ def _procesar_cv_sync(body: dict) -> dict:
         resultado["razon_semaforo"] = f"{razon_actual} | {razon_bg}".strip(" |")
 
         # ── 8. Alerta Telegram si delito grave ────────────────────────────────
-        es_grave, delitos_graves = _tiene_delito_grave(satje, spreadsheet)
+        es_grave, delitos_graves = _tiene_delito_grave(satje, spreadsheet, config_tab)
         if es_grave:
             resultado.setdefault("alertas", []).insert(
                 0, f"🚨 DELITOS GRAVES: {', '.join(delitos_graves)}"
@@ -705,21 +724,23 @@ def _procesar_cv_sync(body: dict) -> dict:
             for aviso in reversed(advertencias_disp):
                 resultado.setdefault("alertas", []).insert(0, aviso)
 
-        # ── 10. Escribir en Sheet ─────────────────────────────────────────────
+        # ── 10. Escribir en Sheet (en la pestaña de la vacante) ───────────────
         metadata = _build_metadata(body, nombre)
-        escribir_candidato(spreadsheet, resultado, metadata)
+        escribir_candidato(spreadsheet, resultado, metadata, vacante=vacante_slug)
         escribir_log(spreadsheet, "OK",
                      f"{semaforo_final} — {nombre}",
                      resultado.get("razon_semaforo", ""),
                      ia=resultado.get("_ia_utilizada", ""),
-                     costo=resultado.get("_costo_usd"))
+                     costo=resultado.get("_costo_usd"),
+                     vacante=vacante_slug)
 
         print(f"[{thread_id}] ✅ {nombre} → FINAL: {semaforo_final} (CV: {cv_semaforo}, BG: {bg.get('semaforo')})")
         return {"status": "ok", "semaforo": semaforo_final, "nombre": resultado.get("nombre"),
-                "cv": cv_semaforo, "bg": bg.get("semaforo")}
+                "cv": cv_semaforo, "bg": bg.get("semaforo"), "vacante": vacante_slug}
 
     except Exception as e:
-        escribir_log(spreadsheet, "ERROR", f"Fallo procesando CV de {nombre}", str(e))
+        escribir_log(spreadsheet, "ERROR", f"Fallo procesando CV de {nombre}", str(e),
+                     vacante=vacante_slug)
         capture_exception("procesar_cv_sync", e,
                           extra={"file_id": file_id, "cedula": cedula,
                                  "nombre": nombre, "thread": thread_id})

@@ -13,9 +13,9 @@ import time
 import threading
 from typing import Any
 
-# Cache singleton de la config
-_cache: dict[str, Any] | None = None
-_cache_ts: float = 0.0
+# Cache por nombre de pestaña (multi-vacante v5.6+):
+# {"Configuracion": (config_dict, timestamp), "Config_AuxLimpieza": (...), ...}
+_cache: dict[str, tuple[dict, float]] = {}
 _cache_lock = threading.Lock()
 
 # TTL del cache (5 min — balance entre frescura y latencia)
@@ -48,60 +48,82 @@ CONFIG_DEFAULT = {
 }
 
 
-def leer_configuracion(spreadsheet, nombre_pestaña="Configuracion") -> dict:
-    """
-    Lee los criterios del cargo desde la pestaña Configuracion.
-    Cacheado por CONFIG_CACHE_TTL (default 5 min) para no estresar la API
-    cuando hay un batch de CVs.
-    """
-    global _cache, _cache_ts
+def _leer_pestaña_raw(spreadsheet, nombre_pestaña: str) -> dict | None:
+    """Lee una pestaña key-value (col A = clave, col B = valor). None si no existe o vacía."""
+    try:
+        hoja = spreadsheet.worksheet(nombre_pestaña)
+    except Exception:
+        return None
+    try:
+        filas = hoja.get_all_values()
+    except Exception as e:
+        print(f"[config_reader] error leyendo '{nombre_pestaña}': {e}")
+        return None
 
+    config: dict[str, Any] = {}
+    for fila in filas:
+        if len(fila) >= 2 and fila[0].strip():
+            clave = fila[0].strip().lower().replace(" ", "_")
+            valor = fila[1].strip()
+            config[clave] = valor
+    return config or None
+
+
+def leer_configuracion(spreadsheet, nombre_pestaña: str = "Configuracion") -> dict:
+    """
+    Lee los criterios del cargo desde una pestaña key-value.
+
+    Cache por nombre de pestaña (multi-vacante): cada Config_<Vacante> tiene su
+    propia entrada en _cache, así no se cruzan vacantes.
+
+    Fallback en cascada:
+      1. Pestaña pedida (ej. Config_AuxLimpieza)
+      2. Pestaña global "Configuracion" (si la pedida no existe)
+      3. CONFIG_DEFAULT (si nada existe en el Sheet)
+    """
     ahora = time.time()
     # Cache hit
-    if _cache is not None and (ahora - _cache_ts) < CONFIG_CACHE_TTL:
-        return _cache
+    entry = _cache.get(nombre_pestaña)
+    if entry and (ahora - entry[1]) < CONFIG_CACHE_TTL:
+        return entry[0]
 
     with _cache_lock:
-        # Double-checked locking
-        if _cache is not None and (ahora - _cache_ts) < CONFIG_CACHE_TTL:
-            return _cache
+        # Double-checked
+        entry = _cache.get(nombre_pestaña)
+        if entry and (ahora - entry[1]) < CONFIG_CACHE_TTL:
+            return entry[0]
 
-        try:
-            hoja = spreadsheet.worksheet(nombre_pestaña)
-            filas = hoja.get_all_values()
+        # 1) intentar la pestaña pedida
+        config = _leer_pestaña_raw(spreadsheet, nombre_pestaña)
 
-            config: dict[str, Any] = {}
-            for fila in filas:
-                if len(fila) >= 2 and fila[0].strip():
-                    clave = fila[0].strip().lower().replace(" ", "_")
-                    valor = fila[1].strip()
-                    config[clave] = valor
-
+        # 2) si no existe y NO es la global, intentar la global como fallback
+        if config is None and nombre_pestaña != "Configuracion":
+            config = _leer_pestaña_raw(spreadsheet, "Configuracion")
             if config:
-                _cache    = config
-                _cache_ts = ahora
-                return _cache
-        except Exception as e:
-            print(f"[config_reader] error leyendo Sheet: {e} — usando defaults")
+                print(f"[config_reader] '{nombre_pestaña}' no existe — usando 'Configuracion' como fallback")
 
-        # Fallback
-        _cache    = dict(CONFIG_DEFAULT)
-        _cache_ts = ahora
-        return _cache
+        # 3) fallback final a defaults hardcoded
+        if config is None:
+            print(f"[config_reader] sin Sheet config — usando CONFIG_DEFAULT")
+            config = dict(CONFIG_DEFAULT)
+
+        _cache[nombre_pestaña] = (config, ahora)
+        return config
 
 
-def obtener_delitos_graves(spreadsheet=None) -> list[str]:
+def obtener_delitos_graves(spreadsheet=None, nombre_pestaña: str = "Configuracion") -> list[str]:
     """
     Devuelve la lista de delitos considerados graves para alertas Telegram
     y semáforo CRÍTICO. Configurable desde Sheet con la clave `delitos_graves`
     (valores separados por coma o pipe).
 
     Si no hay Sheet o la clave no existe → usa DELITOS_GRAVES_DEFAULT.
+    Acepta nombre_pestaña opcional para soportar multi-vacante.
     """
     if spreadsheet is None:
         return list(DELITOS_GRAVES_DEFAULT)
 
-    config = leer_configuracion(spreadsheet)
+    config = leer_configuracion(spreadsheet, nombre_pestaña)
     raw = config.get("delitos_graves", "")
     if not raw:
         return list(DELITOS_GRAVES_DEFAULT)
@@ -117,9 +139,14 @@ def obtener_delitos_graves(spreadsheet=None) -> list[str]:
     return [d.strip().upper() for d in lista if d.strip()]
 
 
-def invalidar_cache() -> None:
-    """Fuerza re-lectura en la próxima llamada. Útil para tests o si admin edita."""
-    global _cache, _cache_ts
+def invalidar_cache(nombre_pestaña: str | None = None) -> None:
+    """Fuerza re-lectura en la próxima llamada.
+
+    Si nombre_pestaña se especifica, solo invalida esa entrada.
+    Si es None, invalida todo (útil en tests).
+    """
     with _cache_lock:
-        _cache    = None
-        _cache_ts = 0.0
+        if nombre_pestaña is None:
+            _cache.clear()
+        else:
+            _cache.pop(nombre_pestaña, None)

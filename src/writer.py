@@ -4,6 +4,8 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from src.vacantes import nombre_hoja_candidatos, nombre_hoja_config, etiqueta_legible
+
 # ── Zona horaria Ecuador ──────────────────────────────────────────────────────
 _TZ_ECUADOR = ZoneInfo("America/Guayaquil")
 
@@ -11,6 +13,39 @@ _TZ_ECUADOR = ZoneInfo("America/Guayaquil")
 _lock_candidatos = threading.Lock()
 _lock_logs       = threading.Lock()
 _lock_config     = threading.Lock()
+_lock_crear_hoja = threading.Lock()   # crea pestañas nuevas (auto-creación por vacante)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Helper multi-vacante: obtener o crear hoja de Candidatos para una vacante
+# ════════════════════════════════════════════════════════════════════════════
+
+def _obtener_o_crear_hoja_candidatos(spreadsheet, vacante_slug: str):
+    """Devuelve la worksheet de candidatos para la vacante.
+
+    Si no existe, la crea con NUM_COLS columnas y aplica el formato premium
+    (dashboard, headers, freeze, anchos). Idempotente y thread-safe.
+    """
+    nombre = nombre_hoja_candidatos(vacante_slug)
+    try:
+        return spreadsheet.worksheet(nombre)
+    except Exception:
+        pass
+
+    # No existe → crearla bajo lock para evitar dobles intentos paralelos
+    with _lock_crear_hoja:
+        try:
+            return spreadsheet.worksheet(nombre)
+        except Exception:
+            pass
+        hoja = spreadsheet.add_worksheet(title=nombre, rows=200, cols=NUM_COLS)
+        print(f"[writer] ✅ pestaña '{nombre}' creada (vacante={etiqueta_legible(vacante_slug)})")
+        # Forzar headers + formato premium inmediatamente
+        try:
+            _asegurar_encabezado(spreadsheet, hoja, [])
+        except Exception as e:
+            print(f"[writer] WARN al inicializar pestaña '{nombre}': {e}")
+        return hoja
 
 
 def _ahora() -> str:
@@ -106,9 +141,9 @@ IDX_SETEC        = 9    # J  ← junto a verificaciones oficiales
 IDX_POTENCIAL    = 16   # Q  ← shift +1
 IDX_CV_LINK      = 19   # T  ← shift +1, archivo al final
 
-# ── Logs: 6 columnas (A–F) ───────────────────────────────────────────────────
-HEADERS_LOGS  = ["Fecha/Hora", "Nivel", "Evento", "Detalle", "IA Utilizada", "Costo USD"]
-ANCHOS_LOGS   = [130, 95, 220, 380, 200, 90]
+# ── Logs: 7 columnas (A–G) ─ v5.6: agregada columna Vacante ─────────────────
+HEADERS_LOGS  = ["Fecha/Hora", "Nivel", "Evento", "Detalle", "IA Utilizada", "Costo USD", "Vacante"]
+ANCHOS_LOGS   = [130, 95, 220, 380, 200, 90, 130]
 NUM_COLS_LOGS = len(HEADERS_LOGS)
 
 # ── Configuracion: 4 columnas (A–D) ──────────────────────────────────────────
@@ -980,11 +1015,17 @@ def _append_con_reintento(hoja, fila: list, max_intentos: int = 4) -> None:
 
 # ── Funciones públicas ────────────────────────────────────────────────────────
 
-def escribir_candidato(spreadsheet, resultado: dict, metadata: dict = None) -> None:
+def escribir_candidato(spreadsheet, resultado: dict, metadata: dict = None,
+                       vacante: str = "") -> None:
+    """Escribe la fila del candidato en la pestaña correspondiente a la vacante.
+
+    Si `vacante` está vacío → escribe en la pestaña legacy "Candidatos".
+    Si `vacante` tiene slug → escribe en "Candidatos_<Slug>" (autocreada si falta).
+    """
     if metadata is None:
         metadata = {}
 
-    hoja     = spreadsheet.worksheet("Candidatos")
+    hoja = _obtener_o_crear_hoja_candidatos(spreadsheet, vacante)
     semaforo_raw = resultado.get("semaforo", "OBSERVACION")
     # Renombrar etiquetas viejas (VERDE/AMARILLO/ROJO/GRIS) a nuevas
     semaforo = RENOMBRE.get(semaforo_raw, semaforo_raw)
@@ -1058,6 +1099,7 @@ def escribir_log(
     detalle: str = "",
     ia: str = "",
     costo=None,
+    vacante: str = "",
 ) -> None:
     hoja   = spreadsheet.worksheet("Logs")
     iconos = {"INFO": "ℹ️", "OK": "✅", "ERROR": "❌", "WARN": "⚠️"}
@@ -1076,6 +1118,7 @@ def escribir_log(
         detalle,
         ia or "",
         costo_str,
+        etiqueta_legible(vacante),   # G  Vacante
     ]
 
     with _lock_logs:
