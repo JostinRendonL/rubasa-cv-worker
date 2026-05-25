@@ -49,12 +49,16 @@ from src.analizador import analizar_cv
 from src.config_reader import leer_configuracion, obtener_delitos_graves
 from src.writer import escribir_candidato, escribir_log
 from src.obs import init_sentry, capture_exception
+from src.metrics import setup_metrics
 
 load_dotenv()
 # Inicializar Sentry (opt-in con SENTRY_DSN) — antes de crear FastAPI
 init_sentry(servicio="cv-worker")
 
-app = FastAPI(title="RUBASA CV Worker", version="5.4.1")
+app = FastAPI(title="RUBASA CV Worker", version="5.5.0")
+
+# Métricas Prometheus opt-in (si METRICS_ENABLED=1)
+setup_metrics(app)
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -835,3 +839,152 @@ async def webhook(
                                  "nombre": payload.nombre})
         _idempotency_finish(payload.file_id, {"status": "error", "detail": str(e)[:200]})
         raise HTTPException(status_code=500, detail=str(e)[:200])
+
+
+# ── Endpoints administrativos ────────────────────────────────────────────────
+
+class ReprocesarPayload(BaseModel):
+    """Payload para forzar re-procesar un CV ya en idempotencia cache."""
+    nombre:                   str = "No indicado"
+    cedula:                   str = ""
+    telefono:                 str = "No indicado"
+    email:                    str = "No indicado"
+    disponibilidad_inmediata: str = ""
+    turnos_rotativos:         str = ""
+    fines_semana:             str = ""
+    movilidad:                str = ""
+    drive_link:               str = ""
+    model_config = {"extra": "allow"}
+
+
+@app.post("/reprocesar/{file_id}")
+async def reprocesar(
+    file_id:        str,
+    payload:        ReprocesarPayload | None = None,
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
+):
+    """
+    Re-procesa un CV específico ignorando la idempotencia cache.
+    Útil cuando:
+      - Algo falló en producción y queremos re-correrlo
+      - Quieres re-evaluar con prompts/criterios actualizados
+      - El cache idempotency dice que ya está pero quieres forzar
+
+    El body es opcional. Si se omite, se usan defaults vacíos.
+    En la práctica conviene mandar al menos cedula+nombre.
+    """
+    _verificar_secret(x_webhook_secret)
+
+    # Invalidar cache de idempotencia para este file_id
+    with _proc_lock:
+        _proc_cache.pop(file_id, None)
+        _proc_in_flight.pop(file_id, None)
+
+    body = (payload.model_dump() if payload else {})
+    body["file_id"] = file_id
+
+    try:
+        async with app.state.semaforo_cvs:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(_pool_cvs, _procesar_cv_sync, body)
+        _idempotency_finish(file_id, result)
+        return {**result, "_reprocesado": True}
+    except Exception as e:
+        capture_exception("reprocesar", e, extra={"file_id": file_id})
+        raise HTTPException(status_code=500, detail=str(e)[:200])
+
+
+class BatchPayload(BaseModel):
+    """Procesar N CVs en una sola llamada (sin pasar por Forms)."""
+    cvs: list[WebhookPayload]
+
+
+@app.post("/batch")
+async def batch(
+    payload:          BatchPayload,
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
+):
+    """
+    Procesa una lista de CVs en paralelo (respeta el semáforo de concurrencia).
+    Útil para:
+      - Onboarding inicial: subir N CVs históricos de un cliente
+      - Re-evaluar todos los candidatos después de cambiar el criterio
+      - Migración desde otro sistema
+
+    Cada CV pasa por la misma idempotencia: si el file_id ya está en cache,
+    se devuelve el resultado anterior sin re-procesar.
+    """
+    _verificar_secret(x_webhook_secret)
+
+    if not payload.cvs:
+        raise HTTPException(status_code=400, detail="lista 'cvs' vacía")
+    if len(payload.cvs) > 100:
+        raise HTTPException(status_code=400, detail="máximo 100 CVs por batch")
+
+    async def _procesar_uno(cv: WebhookPayload):
+        # Cache hit
+        cached = _idempotency_check(cv.file_id)
+        if cached is not None and "_wait_for" not in cached:
+            return {**cached, "_from_cache": True}
+
+        try:
+            async with app.state.semaforo_cvs:
+                loop = asyncio.get_running_loop()
+                r = await loop.run_in_executor(
+                    _pool_cvs, _procesar_cv_sync, cv.model_dump()
+                )
+            _idempotency_finish(cv.file_id, r)
+            return r
+        except Exception as e:
+            capture_exception("batch.procesar_uno", e,
+                              extra={"file_id": cv.file_id, "cedula": cv.cedula})
+            _idempotency_finish(cv.file_id, {"status": "error", "detail": str(e)[:200]})
+            return {"file_id": cv.file_id, "status": "error", "detail": str(e)[:200]}
+
+    resultados = await asyncio.gather(*[_procesar_uno(cv) for cv in payload.cvs])
+    ok    = sum(1 for r in resultados if r.get("status") == "ok")
+    error = sum(1 for r in resultados if r.get("status") == "error")
+    return {
+        "total":      len(payload.cvs),
+        "ok":         ok,
+        "error":      error,
+        "resultados": resultados,
+    }
+
+
+# ── Compliance: derecho al olvido + healthcheck de scheduler ─────────────────
+
+@app.delete("/admin/idempotency/{file_id}")
+async def admin_borrar_idempotency(
+    file_id: str,
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
+):
+    """Borra una entrada del cache de idempotencia (debug/admin)."""
+    _verificar_secret(x_webhook_secret)
+    with _proc_lock:
+        existed = _proc_cache.pop(file_id, None)
+        _proc_in_flight.pop(file_id, None)
+    return {"file_id": file_id, "existia": existed is not None}
+
+
+@app.get("/admin/idempotency")
+async def admin_listar_idempotency(
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
+):
+    """Lista el contenido del cache de idempotencia (debug)."""
+    _verificar_secret(x_webhook_secret)
+    ahora = time.time()
+    with _proc_lock:
+        return {
+            "cache_size": len(_proc_cache),
+            "in_flight":  len(_proc_in_flight),
+            "entries": [
+                {
+                    "file_id": fid[:20],
+                    "edad_seg": int(ahora - data["ts"]),
+                    "status":   data["result"].get("status", "?"),
+                    "nombre":   data["result"].get("nombre", "?"),
+                }
+                for fid, data in _proc_cache.items()
+            ][:50],   # máx 50 para no inundar la respuesta
+        }
