@@ -28,11 +28,15 @@ import asyncio
 import os
 import io
 import json
+import time
 import threading
+import hmac
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Header
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import gspread
 from google.oauth2.service_account import Credentials
@@ -45,7 +49,7 @@ from src.config_reader import leer_configuracion
 from src.writer import escribir_candidato, escribir_log
 
 load_dotenv()
-app = FastAPI(title="RUBASA CV Worker", version="5.3.1")
+app = FastAPI(title="RUBASA CV Worker", version="5.4.0")
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -57,6 +61,20 @@ SCOPES = [
 BG_API_URL = os.getenv("BG_API_URL", "http://dentaklin_bg-api:8000")
 BG_API_KEY = os.getenv("BG_API_KEY", "")
 BG_TIMEOUT = float(os.getenv("BG_API_TIMEOUT", "60"))
+
+# ── Seguridad del webhook ────────────────────────────────────────────────────
+# Secreto que Apps Script debe enviar en cada POST a /webhook. Si no coincide,
+# 401. Sin esto cualquiera con la URL puede saturar la cola y quemar saldo de IA.
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+
+# ── Idempotencia ─────────────────────────────────────────────────────────────
+# Cache en memoria de file_ids recientemente procesados. Si Apps Script reintenta
+# por timeout, el mismo CV no se procesa 2 veces (evita filas duplicadas + doble
+# costo de IA). TTL 1 hora — suficiente para cubrir reintentos típicos.
+IDEMPOTENCY_TTL_SEG = int(os.getenv("IDEMPOTENCY_TTL_SEG", "3600"))
+_proc_cache:   dict[str, dict]   = {}     # file_id → {"ts": epoch, "result": dict}
+_proc_in_flight: dict[str, threading.Event] = {}   # file_id → Event para serialización
+_proc_lock = threading.Lock()
 
 # Lista de delitos considerados GRAVES (disparan alerta Telegram)
 DELITOS_GRAVES = [
@@ -71,6 +89,76 @@ DELITOS_GRAVES = [
 
 # Pool de hilos — 3 CVs en paralelo
 _pool_cvs = ThreadPoolExecutor(max_workers=3, thread_name_prefix="cv-worker")
+
+
+# ── Modelo del payload del webhook ───────────────────────────────────────────
+# Antes: body = await request.json() + body.get(...) sin validación.
+# Ahora: FastAPI valida tipos automáticamente, rechaza 422 si llega basura.
+
+class WebhookPayload(BaseModel):
+    """Payload que envía Apps Script desde el Google Form."""
+    file_id:                  str
+    nombre:                   str = "No indicado"
+    cedula:                   str = ""
+    telefono:                 str = "No indicado"
+    email:                    str = "No indicado"
+    disponibilidad_inmediata: str = ""
+    turnos_rotativos:         str = ""
+    fines_semana:             str = ""
+    movilidad:                str = ""
+    drive_link:               str = ""
+
+    # Permitir campos extra sin fallar (Forms puede mandar más cosas en el futuro)
+    model_config = {"extra": "allow"}
+
+
+# ── Helpers de auth + idempotencia ───────────────────────────────────────────
+
+def _verificar_secret(secret_recibido: str | None) -> None:
+    """Verifica el secret del webhook. Si no coincide → 401."""
+    if not WEBHOOK_SECRET:
+        # Modo permisivo: si la var no está configurada, no se valida.
+        # Útil durante setup inicial — log warning para que se note.
+        print("[security] ⚠️  WEBHOOK_SECRET no configurado — webhook está PÚBLICO")
+        return
+    if not secret_recibido or not hmac.compare_digest(secret_recibido, WEBHOOK_SECRET):
+        raise HTTPException(status_code=401, detail="webhook secret inválido o ausente")
+
+
+def _idempotency_check(file_id: str) -> dict | None:
+    """
+    Si este file_id ya se procesó recientemente o está en proceso, devuelve
+    el resultado cacheado (sin reprocesar). None = procede a procesar.
+    """
+    ahora = time.time()
+    with _proc_lock:
+        # Limpiar cache expirado (cheap, in-place)
+        for fid in list(_proc_cache.keys()):
+            if ahora - _proc_cache[fid]["ts"] > IDEMPOTENCY_TTL_SEG:
+                del _proc_cache[fid]
+
+        # Cache hit fresco
+        if file_id in _proc_cache:
+            print(f"[idempotency] file_id {file_id[:12]}... ya procesado hace "
+                  f"{int(ahora - _proc_cache[file_id]['ts'])}s — devolviendo cache")
+            return _proc_cache[file_id]["result"]
+
+        # Está en proceso por otro thread — esperaremos afuera del lock
+        if file_id in _proc_in_flight:
+            return {"_wait_for": _proc_in_flight[file_id]}
+
+        # Reservamos el slot
+        _proc_in_flight[file_id] = threading.Event()
+        return None
+
+
+def _idempotency_finish(file_id: str, result: dict) -> None:
+    """Marca el file_id como completado y guarda el resultado."""
+    with _proc_lock:
+        _proc_cache[file_id] = {"ts": time.time(), "result": result}
+        evt = _proc_in_flight.pop(file_id, None)
+    if evt:
+        evt.set()  # despierta a quien estuviera esperando
 
 
 # ── Helpers de conexión ──────────────────────────────────────────────────────
@@ -581,19 +669,64 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.0.0"}
+    return {
+        "status":              "ok",
+        "version":             "5.4.0",
+        "webhook_auth":        "enabled" if WEBHOOK_SECRET else "DISABLED (configurar WEBHOOK_SECRET)",
+        "idempotency_cache":   len(_proc_cache),
+        "in_flight":           len(_proc_in_flight),
+    }
 
 
 @app.post("/webhook")
-async def webhook(request: Request):
-    body    = await request.json()
-    file_id = body.get("file_id")
-    if not file_id:
-        raise HTTPException(status_code=400, detail="Falta el campo file_id")
+async def webhook(
+    payload:        WebhookPayload,
+    x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
+):
+    """
+    Procesa un CV desde el Google Form.
 
-    async with app.state.semaforo_cvs:
-        loop = asyncio.get_running_loop()
-        try:
-            return await loop.run_in_executor(_pool_cvs, _procesar_cv_sync, body)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+    Seguridad:
+      - Header `X-Webhook-Secret` debe coincidir con WEBHOOK_SECRET (env).
+      - Payload validado por Pydantic — si falla, 422 antes de gastar IA.
+      - Idempotencia por `file_id` con TTL 1h: reintentos no duplican filas.
+    """
+    # 1. Auth
+    _verificar_secret(x_webhook_secret)
+
+    # 2. Idempotencia
+    cached = _idempotency_check(payload.file_id)
+    if cached is not None:
+        # Caso A: ya está en proceso por otro thread — esperar al Event
+        if "_wait_for" in cached:
+            evt: threading.Event = cached["_wait_for"]
+            # Esperar afuera del lock — máx BG_TIMEOUT+30s antes de timeout HTTP
+            if evt.wait(timeout=BG_TIMEOUT + 30):
+                # Reconsultar cache ya con el resultado
+                with _proc_lock:
+                    if payload.file_id in _proc_cache:
+                        r = _proc_cache[payload.file_id]["result"]
+                        return {**r, "_from_inflight_wait": True}
+            raise HTTPException(status_code=504, detail="Procesamiento en curso, intenta de nuevo")
+        # Caso B: resultado ya listo
+        return {**cached, "_from_cache": True}
+
+    # 3. Procesar normal — el Event ya quedó reservado en _proc_in_flight
+    try:
+        async with app.state.semaforo_cvs:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                _pool_cvs, _procesar_cv_sync, payload.model_dump()
+            )
+        _idempotency_finish(payload.file_id, result)
+        return result
+    except HTTPException:
+        # Liberar el Event antes de relanzar
+        _idempotency_finish(payload.file_id, {"status": "error", "detail": "HTTPException"})
+        raise
+    except Exception as e:
+        # Stack trace completo (antes solo se loguaba str(e))
+        tb = traceback.format_exc()
+        print(f"[webhook] ❌ Error procesando file_id={payload.file_id[:12]}...\n{tb}")
+        _idempotency_finish(payload.file_id, {"status": "error", "detail": str(e)[:200]})
+        raise HTTPException(status_code=500, detail=str(e)[:200])
