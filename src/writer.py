@@ -140,7 +140,8 @@ CONFIG_DEFAULTS = [
 ]
 
 # ── Paleta de colores profesional ─────────────────────────────────────────────
-COLOR_HEADER = {"red": 0.102, "green": 0.227, "blue": 0.361}   # #1A3A5C navy
+# Branding RUBASA Facility Services: colores oficiales del logo + sitio web
+COLOR_HEADER = {"red": 0.059, "green": 0.173, "blue": 0.361}   # #0F2C5C navy oscuro RUBASA
 
 # Niveles de riesgo: colores para fondo de celda F (Semáforo)
 BG_SEMAFORO = {
@@ -153,7 +154,7 @@ BG_SEMAFORO = {
 
 COLOR_TEXTO  = {"red": 0.110, "green": 0.157, "blue": 0.200}   # #1C2833
 COLOR_BORDE  = {"red": 0.835, "green": 0.847, "blue": 0.863}   # #D5D8DC
-COLOR_ACENTO = {"red": 0.161, "green": 0.502, "blue": 0.725}   # #2980B9
+COLOR_ACENTO = {"red": 0.118, "green": 0.357, "blue": 0.980}   # #1E5BFA azul vibrante RUBASA
 
 # Potencial dorado
 COLOR_POTENCIAL_BG     = {"red": 1.0, "green": 0.957, "blue": 0.733}  # #FFF4BB

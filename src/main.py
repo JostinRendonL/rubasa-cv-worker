@@ -33,6 +33,7 @@ import threading
 import hmac
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Header
@@ -45,7 +46,7 @@ from googleapiclient.http import MediaIoBaseDownload
 
 from src.extractor import extraer_desde_drive
 from src.analizador import analizar_cv
-from src.config_reader import leer_configuracion
+from src.config_reader import leer_configuracion, obtener_delitos_graves
 from src.writer import escribir_candidato, escribir_log
 from src.obs import init_sentry, capture_exception
 
@@ -57,7 +58,12 @@ app = FastAPI(title="RUBASA CV Worker", version="5.4.1")
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
+    # drive.file (validado 2026-05-24 contra Rubasa): solo archivos creados/abiertos
+    # por el SA o explícitamente compartidos con su email. La carpeta "Adjuntar CV
+    # (File responses)" está compartida con worker-railway@filtro-cvs-rubasa.iam.gserviceaccount.com
+    # como Editor → todos los CVs subidos por el Form son accesibles.
+    # Si el SA se filtra, el daño potencial es 95% menor que con "drive" completo.
+    "https://www.googleapis.com/auth/drive.file",
 ]
 
 # ── Configuración Background Check API ───────────────────────────────────────
@@ -80,8 +86,9 @@ _proc_cache:   dict[str, dict]   = {}     # file_id → {"ts": epoch, "result": 
 _proc_in_flight: dict[str, threading.Event] = {}   # file_id → Event para serialización
 _proc_lock = threading.Lock()
 
-# Lista de delitos considerados GRAVES (disparan alerta Telegram)
-DELITOS_GRAVES = [
+# Lista de delitos GRAVES — fallback si la Sheet no tiene la clave `delitos_graves`.
+# La versión activa se lee dinámicamente con obtener_delitos_graves(spreadsheet).
+DELITOS_GRAVES_FALLBACK = [
     "ASESINATO", "HOMICIDIO", "FEMICIDIO",
     "DELINCUENCIA ORGANIZADA", "ASOCIACION ILICITA",
     "VIOLACION", "ABUSO SEXUAL", "ABUSO DE MENORES",
@@ -91,8 +98,11 @@ DELITOS_GRAVES = [
     "SECUESTRO", "EXTORSION", "TRATA DE PERSONAS",
 ]
 
-# Pool de hilos — 3 CVs en paralelo
-_pool_cvs = ThreadPoolExecutor(max_workers=3, thread_name_prefix="cv-worker")
+# Pool de hilos para procesar CVs en paralelo. Configurable via env.
+# Default 5 (antes 3) — los workers pasan la mayor parte del tiempo esperando
+# I/O (IA, Drive, bg-api), no CPU. Subir el pool ayuda en picos sin saturar CPU.
+MAX_WORKERS = int(os.getenv("MAX_WORKERS_CV", "5"))
+_pool_cvs = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="cv-worker")
 
 
 # ── Modelo del payload del webhook ───────────────────────────────────────────
@@ -165,24 +175,61 @@ def _idempotency_finish(file_id: str, result: dict) -> None:
         evt.set()  # despierta a quien estuviera esperando
 
 
-# ── Helpers de conexión ──────────────────────────────────────────────────────
+# ── Helpers de conexión (cache singleton) ────────────────────────────────────
+# Antes: cada CV procesado re-autorizaba con Google + reabría el Sheet (200-500ms
+# por log). Cada CV genera 5-7 logs → varios segundos de overhead inútil por CV.
+# Ahora: 1 sola conexión por proceso, reusada vía cache thread-safe.
+
+_creds_cache:  Credentials | None = None
+_sheet_cache:  Any | None = None     # gspread.Spreadsheet
+_creds_lock = threading.Lock()
+_sheet_lock = threading.Lock()
+
 
 def get_creds() -> Credentials:
-    sa_json_str = os.getenv("SA_JSON")
-    if sa_json_str:
-        return Credentials.from_service_account_info(
-            json.loads(sa_json_str), scopes=SCOPES
-        )
-    return Credentials.from_service_account_file(
-        os.getenv("SA_JSON_PATH", "credentials/service_account.json"),
-        scopes=SCOPES,
-    )
+    """Service Account Credentials cacheadas. Thread-safe."""
+    global _creds_cache
+    if _creds_cache is not None:
+        return _creds_cache
+    with _creds_lock:
+        if _creds_cache is not None:   # double-checked locking
+            return _creds_cache
+        sa_json_str = os.getenv("SA_JSON")
+        if sa_json_str:
+            _creds_cache = Credentials.from_service_account_info(
+                json.loads(sa_json_str), scopes=SCOPES
+            )
+        else:
+            _creds_cache = Credentials.from_service_account_file(
+                os.getenv("SA_JSON_PATH", "credentials/service_account.json"),
+                scopes=SCOPES,
+            )
+        return _creds_cache
 
 
 def get_spreadsheet():
-    creds = get_creds()
-    client = gspread.authorize(creds)
-    return client.open_by_key(os.getenv("SHEET_ID"))
+    """Spreadsheet object cacheado. Thread-safe."""
+    global _sheet_cache
+    if _sheet_cache is not None:
+        return _sheet_cache
+    with _sheet_lock:
+        if _sheet_cache is not None:
+            return _sheet_cache
+        creds = get_creds()
+        client = gspread.authorize(creds)
+        _sheet_cache = client.open_by_key(os.getenv("SHEET_ID"))
+        print(f"[sheets] ✅ Spreadsheet cacheado (id={os.getenv('SHEET_ID', '')[:12]}...)")
+        return _sheet_cache
+
+
+def reset_sheet_cache() -> None:
+    """Invalida el cache (útil si el token expira o se cambia SHEET_ID)."""
+    global _creds_cache, _sheet_cache
+    with _creds_lock:
+        _creds_cache = None
+    with _sheet_lock:
+        _sheet_cache = None
+    print("[sheets] cache invalidado")
 
 
 def descargar_pdf_drive(file_id: str, creds: Credentials) -> bytes:
@@ -297,7 +344,7 @@ def _verificar_consistencia(bachiller_ia: str, bachiller_oficial: dict) -> str:
     return "COINCIDE"
 
 
-def _calcular_semaforo_final(cv_semaforo: str, bg: dict) -> str:
+def _calcular_semaforo_final(cv_semaforo: str, bg: dict, spreadsheet=None) -> str:
     """
     Combina nivel de riesgo del CV con resultado del Background.
 
@@ -325,7 +372,7 @@ def _calcular_semaforo_final(cv_semaforo: str, bg: dict) -> str:
     satje = bg.get("satje", {})
 
     # 1. CRITICO — delitos graves siempre ganan
-    hay_grave, _ = _tiene_delito_grave(satje)
+    hay_grave, _ = _tiene_delito_grave(satje, spreadsheet)
     if hay_grave:
         return "CRITICO"
 
@@ -382,12 +429,21 @@ def _resumir_satje(s: dict) -> str:
     return f"🟡 {ta} como actor (víctima/demandante)"
 
 
-def _tiene_delito_grave(s: dict) -> tuple[bool, list[str]]:
-    """Detecta si hay delitos GRAVES → dispara alerta Telegram."""
+def _tiene_delito_grave(s: dict, spreadsheet=None) -> tuple[bool, list[str]]:
+    """
+    Detecta si hay delitos GRAVES → dispara alerta Telegram.
+    La lista se lee dinámicamente de la Sheet (configurable por cliente),
+    con fallback a DELITOS_GRAVES_FALLBACK si no hay Sheet disponible.
+    """
+    try:
+        lista = obtener_delitos_graves(spreadsheet) if spreadsheet else DELITOS_GRAVES_FALLBACK
+    except Exception:
+        lista = DELITOS_GRAVES_FALLBACK
+
     graves = []
     for causa in (s.get("causas_demandado") or []):
         delito = (causa.get("delito") or "").upper()
-        for g in DELITOS_GRAVES:
+        for g in lista:
             if g in delito and g not in graves:
                 graves.append(g)
     return len(graves) > 0, graves
@@ -573,7 +629,7 @@ def _procesar_cv_sync(body: dict) -> dict:
         bachiller_of = bg.get("bachiller", {})
         satje        = bg.get("satje", {})
 
-        semaforo_final = _calcular_semaforo_final(cv_semaforo, bg)
+        semaforo_final = _calcular_semaforo_final(cv_semaforo, bg, spreadsheet)
         coincide       = _verificar_consistencia(bachiller_ia, bachiller_of)
 
         # Sobreescribir el semáforo principal con el FINAL (mom filtra por columna E)
@@ -596,7 +652,7 @@ def _procesar_cv_sync(body: dict) -> dict:
         resultado["razon_semaforo"] = f"{razon_actual} | {razon_bg}".strip(" |")
 
         # ── 8. Alerta Telegram si delito grave ────────────────────────────────
-        es_grave, delitos_graves = _tiene_delito_grave(satje)
+        es_grave, delitos_graves = _tiene_delito_grave(satje, spreadsheet)
         if es_grave:
             resultado.setdefault("alertas", []).insert(
                 0, f"🚨 DELITOS GRAVES: {', '.join(delitos_graves)}"
@@ -647,7 +703,7 @@ def _build_metadata(body: dict, nombre: str) -> dict:
 
 @app.on_event("startup")
 async def startup_event():
-    app.state.semaforo_cvs = asyncio.Semaphore(3)
+    app.state.semaforo_cvs = asyncio.Semaphore(MAX_WORKERS)
     print("🚀 RUBASA CV Worker v5 — con Background Checks integrado")
     print(f"   BG_API_URL: {BG_API_URL}")
     try:
@@ -674,14 +730,56 @@ def root():
 
 
 @app.get("/health")
-def health():
-    return {
+def health(deep: bool = False):
+    """
+    Healthcheck.
+      /health         — liveness simple (rápido, lo usa Docker HEALTHCHECK)
+      /health?deep=1  — valida dependencias externas: bg-api + Google Sheets
+                        (más lento, no usar como liveness)
+    """
+    base = {
         "status":              "ok",
-        "version":             "5.4.0",
+        "version":             "5.4.1",
         "webhook_auth":        "enabled" if WEBHOOK_SECRET else "DISABLED (configurar WEBHOOK_SECRET)",
+        "sentry":              "enabled" if os.getenv("SENTRY_DSN") else "disabled",
         "idempotency_cache":   len(_proc_cache),
         "in_flight":           len(_proc_in_flight),
     }
+    if not deep:
+        return base
+
+    # Deep check — útil para dashboards y alertas
+    deps: dict[str, Any] = {}
+
+    # 1) bg-api
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            r = client.get(f"{BG_API_URL}/health")
+            deps["bg_api"] = {
+                "status":      "ok" if r.status_code == 200 else "degraded",
+                "http_code":   r.status_code,
+                "url":         BG_API_URL,
+            }
+    except Exception as e:
+        deps["bg_api"] = {"status": "down", "error": str(e)[:120], "url": BG_API_URL}
+
+    # 2) Google Sheets (intentar abrir el spreadsheet cacheado)
+    try:
+        ss = get_spreadsheet()
+        deps["google_sheets"] = {"status": "ok", "title": ss.title[:60]}
+    except Exception as e:
+        deps["google_sheets"] = {"status": "down", "error": str(e)[:120]}
+
+    # Estado global
+    overall = "ok"
+    for v in deps.values():
+        if v.get("status") == "down":
+            overall = "down"
+            break
+        if v.get("status") == "degraded" and overall == "ok":
+            overall = "degraded"
+
+    return {**base, "status": overall, "deps": deps}
 
 
 @app.post("/webhook")
