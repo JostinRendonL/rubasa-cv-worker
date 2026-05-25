@@ -109,6 +109,39 @@ class TestResumirSatje:
         assert "🔴" in r
         assert "HOMICIDIO" in r
 
+    def test_solo_alimentos_demandado(self):
+        # Regla RUBASA: demanda de alimentos → 🟡 (no descalifica)
+        r = _resumir_satje({
+            "total_demandado": 1, "total_actor": 0,
+            "causas_demandado": [{
+                "delito":  "PENSION ALIMENTICIA",
+                "materia": "FAMILIA, MUJER, NIÑEZ Y ADOLESCENCIA",
+            }],
+        })
+        assert "🟡" in r
+        assert "alimenticia" in r.lower()
+        assert "🔴" not in r
+
+    def test_solo_alimentos_actor(self):
+        r = _resumir_satje({
+            "total_demandado": 0, "total_actor": 1,
+            "causas_actor": [{"materia": "FAMILIA — ALIMENTOS"}],
+        })
+        assert "🟡" in r
+        assert "alimenticia" in r.lower()
+
+    def test_alimentos_mas_otro_delito(self):
+        # Mixto (alimentos + estafa) → debe seguir mostrando 🔴 con el delito real
+        r = _resumir_satje({
+            "total_demandado": 2, "total_actor": 0,
+            "causas_demandado": [
+                {"delito": "PENSION ALIMENTICIA"},
+                {"delito": "ESTAFA"},
+            ],
+        })
+        assert "🔴" in r
+        assert "ESTAFA" in r
+
 
 class TestResumirSetec:
     def test_sin_dato(self):
@@ -165,6 +198,30 @@ class TestCalcularSemaforoFinal:
         bg = {"semaforo": "GRIS", "satje": {"total_demandado": 0}}
         r = _calcular_semaforo_final("AMARILLO", bg)
         assert r == "OBSERVACION"   # mantiene el nivel del CV
+
+    def test_alimentos_solos_no_descalifica(self):
+        # Regla negocio: demanda de alimentos como demandado → OBSERVACION, no RECHAZAR
+        bg = {"semaforo": "AMARILLO", "satje": {
+            "total_demandado": 1,
+            "causas_demandado": [{
+                "delito":  "PENSION ALIMENTICIA",
+                "materia": "FAMILIA, MUJER, NIÑEZ Y ADOLESCENCIA",
+            }],
+        }}
+        r = _calcular_semaforo_final("VERDE", bg)
+        assert r == "OBSERVACION"
+
+    def test_alimentos_mas_otro_delito_si_rechaza(self):
+        # Mixto: alimentos + estafa → RECHAZAR (no aplica excepción)
+        bg = {"semaforo": "AMARILLO", "satje": {
+            "total_demandado": 2,
+            "causas_demandado": [
+                {"delito": "PENSION ALIMENTICIA"},
+                {"delito": "ESTAFA"},
+            ],
+        }}
+        r = _calcular_semaforo_final("VERDE", bg)
+        assert r == "RECHAZAR"
 
 
 class TestNormalizar:

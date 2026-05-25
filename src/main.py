@@ -55,7 +55,7 @@ load_dotenv()
 # Inicializar Sentry (opt-in con SENTRY_DSN) — antes de crear FastAPI
 init_sentry(servicio="cv-worker")
 
-app = FastAPI(title="RUBASA CV Worker", version="5.5.0")
+app = FastAPI(title="RUBASA CV Worker", version="5.5.1")
 
 # Métricas Prometheus opt-in (si METRICS_ENABLED=1)
 setup_metrics(app)
@@ -93,6 +93,31 @@ IDEMPOTENCY_TTL_SEG = int(os.getenv("IDEMPOTENCY_TTL_SEG", "3600"))
 _proc_cache:   dict[str, dict]   = {}     # file_id → {"ts": epoch, "result": dict}
 _proc_in_flight: dict[str, threading.Event] = {}   # file_id → Event para serialización
 _proc_lock = threading.Lock()
+
+# Palabras clave que identifican una causa por pensión alimenticia.
+# Estas causas NO descalifican laboralmente (RECHAZAR → OBSERVACION).
+# Se busca en los campos `delito` y `materia` que devuelve el bg-api/SATJE.
+PALABRAS_ALIMENTOS = (
+    "ALIMENTOS",
+    "PENSION ALIMENTICIA",
+    "PENSIÓN ALIMENTICIA",
+    "FIJACION DE PENSION",
+    "FIJACIÓN DE PENSIÓN",
+)
+
+
+def _es_causa_de_alimentos(causa: dict) -> bool:
+    """True si la causa es por pensión alimenticia (no descalifica laboralmente)."""
+    delito  = (causa.get("delito") or "").upper()
+    materia = (causa.get("materia") or "").upper()
+    return any(p in delito or p in materia for p in PALABRAS_ALIMENTOS)
+
+
+def _solo_alimentos(satje: dict) -> bool:
+    """True si TODAS las causas (demandado + actor) son por alimentos."""
+    todas = (satje.get("causas_demandado") or []) + (satje.get("causas_actor") or [])
+    return bool(todas) and all(_es_causa_de_alimentos(c) for c in todas)
+
 
 # Lista de delitos GRAVES — fallback si la Sheet no tiene la clave `delitos_graves`.
 # La versión activa se lee dinámicamente con obtener_delitos_graves(spreadsheet).
@@ -385,9 +410,13 @@ def _calcular_semaforo_final(cv_semaforo: str, bg: dict, spreadsheet=None) -> st
         return "CRITICO"
 
     # 2. RECHAZAR — CV ya era rechazado, o tiene procesos como demandado
+    #    Excepción: si TODAS las causas son por pensión alimenticia, NO descalifica
+    #    laboralmente — solo dispara OBSERVACIÓN (regla de negocio RUBASA).
     if cv_nivel == "RECHAZAR":
         return "RECHAZAR"
     if satje.get("total_demandado", 0) > 0:
+        if _solo_alimentos(satje):
+            return "OBSERVACION"
         return "RECHAZAR"
 
     # 3. SIN_DATOS — bg con error → mantener nivel del CV
@@ -423,6 +452,10 @@ def _resumir_satje(s: dict) -> str:
     ta = s.get("total_actor", 0)
     if td == 0 and ta == 0:
         return "✅ Sin procesos"
+    # Caso especial: TODAS las causas son por pensión alimenticia → no descalifica
+    if _solo_alimentos(s):
+        total = td + ta
+        return f"🟡 {total} pensión alimenticia (no descalifica laboralmente)"
     # Listar delitos como demandado (los más graves)
     delitos = []
     for causa in (s.get("causas_demandado") or [])[:5]:
