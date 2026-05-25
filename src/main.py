@@ -47,9 +47,13 @@ from src.extractor import extraer_desde_drive
 from src.analizador import analizar_cv
 from src.config_reader import leer_configuracion
 from src.writer import escribir_candidato, escribir_log
+from src.obs import init_sentry, capture_exception
 
 load_dotenv()
-app = FastAPI(title="RUBASA CV Worker", version="5.4.0")
+# Inicializar Sentry (opt-in con SENTRY_DSN) — antes de crear FastAPI
+init_sentry(servicio="cv-worker")
+
+app = FastAPI(title="RUBASA CV Worker", version="5.4.1")
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -619,7 +623,9 @@ def _procesar_cv_sync(body: dict) -> dict:
 
     except Exception as e:
         escribir_log(spreadsheet, "ERROR", f"Fallo procesando CV de {nombre}", str(e))
-        print(f"[{thread_id}] ❌ Error: {e}")
+        capture_exception("procesar_cv_sync", e,
+                          extra={"file_id": file_id, "cedula": cedula,
+                                 "nombre": nombre, "thread": thread_id})
         raise
 
 
@@ -725,8 +731,9 @@ async def webhook(
         _idempotency_finish(payload.file_id, {"status": "error", "detail": "HTTPException"})
         raise
     except Exception as e:
-        # Stack trace completo (antes solo se loguaba str(e))
-        tb = traceback.format_exc()
-        print(f"[webhook] ❌ Error procesando file_id={payload.file_id[:12]}...\n{tb}")
+        capture_exception("webhook.procesar", e,
+                          extra={"file_id": payload.file_id,
+                                 "cedula": payload.cedula,
+                                 "nombre": payload.nombre})
         _idempotency_finish(payload.file_id, {"status": "error", "detail": str(e)[:200]})
         raise HTTPException(status_code=500, detail=str(e)[:200])
