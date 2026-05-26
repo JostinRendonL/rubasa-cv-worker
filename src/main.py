@@ -58,7 +58,7 @@ load_dotenv()
 # Inicializar Sentry (opt-in con SENTRY_DSN) — antes de crear FastAPI
 init_sentry(servicio="cv-worker")
 
-app = FastAPI(title="RUBASA CV Worker", version="5.7.1")
+app = FastAPI(title="RUBASA CV Worker", version="5.7.2")
 
 # Métricas Prometheus opt-in (si METRICS_ENABLED=1)
 setup_metrics(app)
@@ -975,11 +975,18 @@ async def _procesar_cv_background(file_id: str, body: dict) -> None:
 async def webhook(
     payload:        WebhookPayload,
     x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
+    force:          bool = False,
 ):
     """
     Procesa un CV desde el Google Form. FIRE-AND-FORGET: devuelve 202
     inmediatamente y procesa en background. Apps Script no espera el
     resultado (evita timeouts 524 de Cloudflare a los 100s).
+
+    Query params:
+      - force=1 → bypasea idempotency cache. Util para pruebas manuales donde
+                  queres procesar el mismo file_id con cedula distinta.
+                  En produccion (Apps Script) NUNCA lo uses — perdes la
+                  proteccion de retries duplicados.
 
     Seguridad:
       - Header `X-Webhook-Secret` debe coincidir con WEBHOOK_SECRET (env).
@@ -989,19 +996,29 @@ async def webhook(
     # 1. Auth
     _verificar_secret(x_webhook_secret)
 
-    # 2. Idempotencia
-    cached = _idempotency_check(payload.file_id)
-    if cached is not None:
-        # Caso A: ya está en proceso por otro thread — devolver "processing"
-        if "_wait_for" in cached:
-            return {
-                "status":   "processing",
-                "file_id":  payload.file_id,
-                "nombre":   payload.nombre,
-                "_from_inflight": True,
-            }
-        # Caso B: resultado ya listo (idempotencia)
-        return {**cached, "_from_cache": True}
+    # 2. Idempotencia (skip si ?force=1)
+    if not force:
+        cached = _idempotency_check(payload.file_id)
+        if cached is not None:
+            # Caso A: ya está en proceso por otro thread — devolver "processing"
+            if "_wait_for" in cached:
+                return {
+                    "status":   "processing",
+                    "file_id":  payload.file_id,
+                    "nombre":   payload.nombre,
+                    "_from_inflight": True,
+                }
+            # Caso B: resultado ya listo (idempotencia)
+            return {**cached, "_from_cache": True}
+    else:
+        # Force mode: invalidar entrada vieja si existe para que el background task
+        # pueda registrar nueva. Sin esto, _idempotency_finish puede pisar mal.
+        try:
+            with _proc_lock:
+                _proc_cache.pop(payload.file_id, None)
+                _proc_in_flight.pop(payload.file_id, None)
+        except Exception:
+            pass
 
     # 3. Lanzar procesamiento en background, devolver 202 inmediato
     asyncio.create_task(_procesar_cv_background(payload.file_id, payload.model_dump()))
@@ -1009,6 +1026,7 @@ async def webhook(
         "status":   "accepted",
         "file_id":  payload.file_id,
         "nombre":   payload.nombre,
+        "forced":   force,
         "detail":   "Procesamiento iniciado en background. El resultado se escribe en Sheets cuando termina (~30-90s).",
     }
 
