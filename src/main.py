@@ -58,7 +58,7 @@ load_dotenv()
 # Inicializar Sentry (opt-in con SENTRY_DSN) — antes de crear FastAPI
 init_sentry(servicio="cv-worker")
 
-app = FastAPI(title="RUBASA CV Worker", version="5.7.0")
+app = FastAPI(title="RUBASA CV Worker", version="5.7.1")
 
 # Métricas Prometheus opt-in (si METRICS_ENABLED=1)
 setup_metrics(app)
@@ -950,13 +950,36 @@ def health(deep: bool = False):
     return {**base, "status": overall, "deps": deps}
 
 
-@app.post("/webhook")
+async def _procesar_cv_background(file_id: str, body: dict) -> None:
+    """
+    Worker que corre en background despues de que el webhook devolvio 202.
+    Toma el semáforo, ejecuta el procesamiento sync en el thread pool y
+    libera la idempotencia con el resultado.
+    """
+    try:
+        async with app.state.semaforo_cvs:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                _pool_cvs, _procesar_cv_sync, body
+            )
+        _idempotency_finish(file_id, result)
+    except Exception as e:
+        capture_exception("webhook.background", e,
+                          extra={"file_id": file_id,
+                                 "cedula": body.get("cedula"),
+                                 "nombre": body.get("nombre")})
+        _idempotency_finish(file_id, {"status": "error", "detail": str(e)[:200]})
+
+
+@app.post("/webhook", status_code=202)
 async def webhook(
     payload:        WebhookPayload,
     x_webhook_secret: str | None = Header(default=None, alias="X-Webhook-Secret"),
 ):
     """
-    Procesa un CV desde el Google Form.
+    Procesa un CV desde el Google Form. FIRE-AND-FORGET: devuelve 202
+    inmediatamente y procesa en background. Apps Script no espera el
+    resultado (evita timeouts 524 de Cloudflare a los 100s).
 
     Seguridad:
       - Header `X-Webhook-Secret` debe coincidir con WEBHOOK_SECRET (env).
@@ -969,40 +992,25 @@ async def webhook(
     # 2. Idempotencia
     cached = _idempotency_check(payload.file_id)
     if cached is not None:
-        # Caso A: ya está en proceso por otro thread — esperar al Event
+        # Caso A: ya está en proceso por otro thread — devolver "processing"
         if "_wait_for" in cached:
-            evt: threading.Event = cached["_wait_for"]
-            # Esperar afuera del lock — máx BG_TIMEOUT+30s antes de timeout HTTP
-            if evt.wait(timeout=BG_TIMEOUT + 30):
-                # Reconsultar cache ya con el resultado
-                with _proc_lock:
-                    if payload.file_id in _proc_cache:
-                        r = _proc_cache[payload.file_id]["result"]
-                        return {**r, "_from_inflight_wait": True}
-            raise HTTPException(status_code=504, detail="Procesamiento en curso, intenta de nuevo")
-        # Caso B: resultado ya listo
+            return {
+                "status":   "processing",
+                "file_id":  payload.file_id,
+                "nombre":   payload.nombre,
+                "_from_inflight": True,
+            }
+        # Caso B: resultado ya listo (idempotencia)
         return {**cached, "_from_cache": True}
 
-    # 3. Procesar normal — el Event ya quedó reservado en _proc_in_flight
-    try:
-        async with app.state.semaforo_cvs:
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                _pool_cvs, _procesar_cv_sync, payload.model_dump()
-            )
-        _idempotency_finish(payload.file_id, result)
-        return result
-    except HTTPException:
-        # Liberar el Event antes de relanzar
-        _idempotency_finish(payload.file_id, {"status": "error", "detail": "HTTPException"})
-        raise
-    except Exception as e:
-        capture_exception("webhook.procesar", e,
-                          extra={"file_id": payload.file_id,
-                                 "cedula": payload.cedula,
-                                 "nombre": payload.nombre})
-        _idempotency_finish(payload.file_id, {"status": "error", "detail": str(e)[:200]})
-        raise HTTPException(status_code=500, detail=str(e)[:200])
+    # 3. Lanzar procesamiento en background, devolver 202 inmediato
+    asyncio.create_task(_procesar_cv_background(payload.file_id, payload.model_dump()))
+    return {
+        "status":   "accepted",
+        "file_id":  payload.file_id,
+        "nombre":   payload.nombre,
+        "detail":   "Procesamiento iniciado en background. El resultado se escribe en Sheets cuando termina (~30-90s).",
+    }
 
 
 # ── Endpoints administrativos ────────────────────────────────────────────────
