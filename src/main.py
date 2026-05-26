@@ -58,7 +58,7 @@ load_dotenv()
 # Inicializar Sentry (opt-in con SENTRY_DSN) — antes de crear FastAPI
 init_sentry(servicio="cv-worker")
 
-app = FastAPI(title="RUBASA CV Worker", version="5.6.0")
+app = FastAPI(title="RUBASA CV Worker", version="5.7.0")
 
 # Métricas Prometheus opt-in (si METRICS_ENABLED=1)
 setup_metrics(app)
@@ -365,6 +365,90 @@ def _resumir_setec(st: dict) -> str:
     return "Sin registros"
 
 
+# ── Fiscalía SIAF API client ─────────────────────────────────────────────────
+
+def consultar_fiscalia_sync(cedula: str) -> dict:
+    """
+    Llama síncronamente al endpoint /consultar/fiscalia del bg-api.
+    Retorna dict con tiene_antecedentes, noticias, como_sospechoso,
+    como_denunciante, total_noticias, delitos.
+    """
+    if not cedula or not cedula.isdigit() or len(cedula) != 10:
+        return {
+            "error":              "Cédula inválida",
+            "tiene_antecedentes": False,
+            "noticias":           [],
+            "como_sospechoso":    0,
+            "como_denunciante":   0,
+            "total_noticias":     0,
+            "delitos":            [],
+        }
+    try:
+        with httpx.Client(timeout=BG_TIMEOUT) as client:
+            r = client.post(
+                f"{BG_API_URL}/consultar/fiscalia",
+                headers={"X-API-Key": BG_API_KEY, "Content-Type": "application/json"},
+                json={"cedula": cedula},
+            )
+            r.raise_for_status()
+            return r.json()
+    except Exception as e:
+        return {
+            "error":              str(e)[:200],
+            "tiene_antecedentes": False,
+            "noticias":           [],
+            "como_sospechoso":    0,
+            "como_denunciante":   0,
+            "total_noticias":     0,
+            "delitos":            [],
+        }
+
+
+def _resumir_fiscalia(fi: dict) -> str:
+    """
+    Texto compacto para la columna U (Noticias del Delito — SIAF).
+
+    Códigos:
+      ❌ Error    — fallo de consulta (red, proxy, Incapsula)
+      🔴 N como sospechoso: DELITO1 | DELITO2 — aparece como imputado/procesado
+      🟡 N como denunciante/víctima — solo neutro (no descalifica)
+      ✅ Sin antecedentes — limpio en SIAF
+    """
+    if not fi:
+        return "—"
+    if fi.get("error"):
+        return f"❌ Error: {fi['error'][:60]}"
+    sospechoso  = fi.get("como_sospechoso", 0)
+    denunciante = fi.get("como_denunciante", 0)
+    delitos     = fi.get("delitos", []) or []
+    if sospechoso > 0:
+        delitos_txt = " | ".join(delitos[:3])[:120]
+        extra = f" (+{len(delitos)-3})" if len(delitos) > 3 else ""
+        return f"🔴 {sospechoso} como sospechoso: {delitos_txt}{extra}"
+    if denunciante > 0:
+        return f"🟡 {denunciante} como denunciante/víctima"
+    return "✅ Sin antecedentes"
+
+
+def _tiene_delito_grave_fiscalia(fi: dict, spreadsheet=None, config_tab: str = "Configuracion") -> tuple[bool, list[str]]:
+    """
+    Detecta si los delitos de Fiscalia son graves.
+    Usa la misma lista configurable de la Sheet que SATJE.
+    """
+    try:
+        lista = obtener_delitos_graves(spreadsheet, config_tab) if spreadsheet else DELITOS_GRAVES_FALLBACK
+    except Exception:
+        lista = DELITOS_GRAVES_FALLBACK
+
+    graves = []
+    for delito in (fi.get("delitos") or []):
+        d_up = (delito or "").upper()
+        for g in lista:
+            if g in d_up and g not in graves:
+                graves.append(g)
+    return len(graves) > 0, graves
+
+
 def _verificar_consistencia(bachiller_ia: str, bachiller_oficial: dict) -> str:
     """
     Compara lo que la IA leyó del CV con lo que el Ministerio confirma.
@@ -385,18 +469,17 @@ def _verificar_consistencia(bachiller_ia: str, bachiller_oficial: dict) -> str:
 
 
 def _calcular_semaforo_final(cv_semaforo: str, bg: dict, spreadsheet=None,
-                              config_tab: str = "Configuracion") -> str:
+                              config_tab: str = "Configuracion",
+                              fiscalia: dict | None = None) -> str:
     """
-    Combina nivel de riesgo del CV con resultado del Background.
+    Combina nivel de riesgo del CV con resultado del Background + Fiscalía.
 
     Niveles (de mayor a menor riesgo):
-      CRITICO    — Delitos graves detectados (homicidio, narcos, etc)
-      RECHAZAR   — CV ya era ROJO, O procesos judiciales como demandado (sin delitos graves)
-      OBSERVACION— CV era AMARILLO, O mintió sobre bachiller, O procesos como actor
-      APTO       — CV apto Y sin observaciones en background
+      CRITICO    — Delitos graves detectados en SATJE o Fiscalía
+      RECHAZAR   — CV ya era ROJO, procesos como demandado, o aparece sospechoso en Fiscalía
+      OBSERVACION— CV era AMARILLO, mintió sobre bachiller, procesos como actor, o denunciante en Fiscalía
+      APTO       — CV apto Y sin observaciones en ningún background
       SIN_DATOS  — error en BG, mantener veredicto del CV mapeado a los nuevos niveles
-
-    Compatibilidad: si el CV viene con etiqueta vieja (VERDE/AMARILLO/ROJO) la mapeamos.
     """
     # Mapeo de etiquetas viejas → nuevas (por compatibilidad con analizador.py)
     mapa = {
@@ -411,20 +494,23 @@ def _calcular_semaforo_final(cv_semaforo: str, bg: dict, spreadsheet=None,
     cv_nivel = mapa.get((cv_semaforo or "").upper(), "OBSERVACION")
 
     satje = bg.get("satje", {})
+    fi    = fiscalia or {}
 
-    # 1. CRITICO — delitos graves siempre ganan
-    hay_grave, _ = _tiene_delito_grave(satje, spreadsheet, config_tab)
-    if hay_grave:
+    # 1. CRITICO — delitos graves siempre ganan, vengan de SATJE o Fiscalía
+    hay_grave_satje, _    = _tiene_delito_grave(satje, spreadsheet, config_tab)
+    hay_grave_fiscalia, _ = _tiene_delito_grave_fiscalia(fi, spreadsheet, config_tab)
+    if hay_grave_satje or hay_grave_fiscalia:
         return "CRITICO"
 
-    # 2. RECHAZAR — CV ya era rechazado, o tiene procesos como demandado
-    #    Excepción: si TODAS las causas son por pensión alimenticia, NO descalifica
-    #    laboralmente — solo dispara OBSERVACIÓN (regla de negocio RUBASA).
+    # 2. RECHAZAR — CV ya rechazado, procesos como demandado, o sospechoso en Fiscalía
     if cv_nivel == "RECHAZAR":
         return "RECHAZAR"
     if satje.get("total_demandado", 0) > 0:
         if _solo_alimentos(satje):
             return "OBSERVACION"
+        return "RECHAZAR"
+    # Fiscalía: aparece como sospechoso/imputado/procesado (no es solo denuncia)
+    if fi.get("tiene_antecedentes") and fi.get("como_sospechoso", 0) > 0:
         return "RECHAZAR"
 
     # 3. SIN_DATOS — bg con error → mantener nivel del CV
@@ -432,8 +518,10 @@ def _calcular_semaforo_final(cv_semaforo: str, bg: dict, spreadsheet=None,
     if bg_semaforo == "GRIS":
         return cv_nivel  # ya está mapeado
 
-    # 4. OBSERVACION — cualquiera de los dos tiene observación
+    # 4. OBSERVACION — cualquiera de los tres tiene observación
     if cv_nivel == "OBSERVACION" or bg_semaforo == "AMARILLO":
+        return "OBSERVACION"
+    if fi.get("como_denunciante", 0) > 0:
         return "OBSERVACION"
 
     # 5. APTO
@@ -653,34 +741,44 @@ def _procesar_cv_sync(body: dict) -> dict:
             spreadsheet=spreadsheet, nombre=nombre,
         )
 
-        # ── 6. Background Check + SETEC EN PARALELO ───────────────────────────
-        # Ambas son llamadas HTTP independientes al bg-api. SETEC tarda ~20-60s
-        # (Playwright). Si las hacemos en serie, sumamos tiempos. ThreadPoolExecutor
-        # local de 2 workers para correrlas concurrentemente.
-        bg    = {"semaforo": "GRIS"}
-        setec = {}
+        # ── 6. Background + SETEC + Fiscalía EN PARALELO ──────────────────────
+        # Tres llamadas HTTP independientes al bg-api. SETEC y Fiscalía tardan
+        # ~20-60s cada una (Playwright). En paralelo el tiempo total = max(3),
+        # no la suma. ThreadPoolExecutor con 3 workers.
+        bg       = {"semaforo": "GRIS"}
+        setec    = {}
+        fiscalia = {}
         if cedula:
             if not _cedula_valida_ec(cedula):
-                print(f"[{thread_id}] Cédula '{cedula}' inválida (no pasa dígito verificador) — saltando bg-api+SETEC")
+                print(f"[{thread_id}] Cédula '{cedula}' inválida (no pasa dígito verificador) — saltando bg-api+SETEC+Fiscalía")
                 escribir_log(spreadsheet, "WARN",
                              f"Cédula inválida: {nombre}",
-                             f"'{cedula}' no pasa validación del Registro Civil — bg-api+SETEC no consultados",
+                             f"'{cedula}' no pasa validación del Registro Civil — bg-api+SETEC+Fiscalía no consultados",
                              ia="validación local", costo=0.0,
                              vacante=vacante_slug)
             else:
-                print(f"[{thread_id}] Consultando background + SETEC en paralelo para {cedula}...")
-                with ThreadPoolExecutor(max_workers=2, thread_name_prefix=f"bg-{cedula[:4]}") as ex:
-                    f_bg    = ex.submit(consultar_background_sync, cedula)
-                    f_setec = ex.submit(consultar_setec_sync, cedula)
-                    bg    = f_bg.result()
-                    setec = f_setec.result()
+                print(f"[{thread_id}] Consultando background + SETEC + Fiscalía en paralelo para {cedula}...")
+                with ThreadPoolExecutor(max_workers=3, thread_name_prefix=f"bg-{cedula[:4]}") as ex:
+                    f_bg       = ex.submit(consultar_background_sync, cedula)
+                    f_setec    = ex.submit(consultar_setec_sync, cedula)
+                    f_fiscalia = ex.submit(consultar_fiscalia_sync, cedula)
+                    bg       = f_bg.result()
+                    setec    = f_setec.result()
+                    fiscalia = f_fiscalia.result()
                 setec_status = "OK" if setec.get("tiene_certificados") else ("ERROR" if setec.get("error") else "sin")
+                fisc_status = (
+                    "ERROR" if fiscalia.get("error")
+                    else "SOSPECHOSO" if fiscalia.get("como_sospechoso", 0) > 0
+                    else "DENUNCIANTE" if fiscalia.get("como_denunciante", 0) > 0
+                    else "limpio"
+                )
                 escribir_log(spreadsheet, "INFO",
-                             f"Background+SETEC: {nombre}",
+                             f"Background+SETEC+Fiscalía: {nombre}",
                              f"BG semáforo={bg.get('semaforo')} | "
                              f"SETEC={setec_status} ({setec.get('total_cursos', 0)} cert.) | "
+                             f"Fiscalía={fisc_status} ({fiscalia.get('total_noticias', 0)} noticias) | "
                              f"tiempo BG={bg.get('tiempo_seg', '?')}s",
-                             ia="bg-api", costo=0.005,
+                             ia="bg-api", costo=0.007,
                              vacante=vacante_slug)
 
         # ── 7. Calcular Semáforo FINAL y agregar campos al resultado ──────────
@@ -689,7 +787,8 @@ def _procesar_cv_sync(body: dict) -> dict:
         bachiller_of = bg.get("bachiller", {})
         satje        = bg.get("satje", {})
 
-        semaforo_final = _calcular_semaforo_final(cv_semaforo, bg, spreadsheet, config_tab)
+        semaforo_final = _calcular_semaforo_final(cv_semaforo, bg, spreadsheet, config_tab,
+                                                   fiscalia=fiscalia)
         coincide       = _verificar_consistencia(bachiller_ia, bachiller_of)
 
         # Sobreescribir el semáforo principal con el FINAL (mom filtra por columna E)
@@ -699,6 +798,7 @@ def _procesar_cv_sync(body: dict) -> dict:
         resultado["coincide_cv"]                = coincide
         resultado["satje_resumen"]              = _resumir_satje(satje)
         resultado["setec_resumen"]              = _resumir_setec(setec)
+        resultado["fiscalia_resumen"]           = _resumir_fiscalia(fiscalia)
 
         # Inyectar advertencia "mintió en CV" si aplica
         if coincide == "MINTIO":
@@ -706,16 +806,22 @@ def _procesar_cv_sync(body: dict) -> dict:
                 0, "🚨 INCONSISTENCIA: CV dice bachiller pero Ministerio NO lo confirma"
             )
 
-        # Enriquecer "razón veredicto" con datos BG
+        # Enriquecer "razón veredicto" con datos BG + Fiscalía
         razon_actual = resultado.get("razon_semaforo", "")
-        razon_bg     = f"BG: {resultado['bachiller_oficial_resumen']} · {resultado['satje_resumen']}"
+        razon_bg     = f"BG: {resultado['bachiller_oficial_resumen']} · {resultado['satje_resumen']} · Fiscalía: {resultado['fiscalia_resumen']}"
         resultado["razon_semaforo"] = f"{razon_actual} | {razon_bg}".strip(" |")
 
-        # ── 8. Alerta Telegram si delito grave ────────────────────────────────
-        es_grave, delitos_graves = _tiene_delito_grave(satje, spreadsheet, config_tab)
-        if es_grave:
+        # ── 8. Alerta Telegram si delito grave (SATJE o Fiscalía) ─────────────
+        es_grave_satje, delitos_satje = _tiene_delito_grave(satje, spreadsheet, config_tab)
+        es_grave_fisc,  delitos_fisc  = _tiene_delito_grave_fiscalia(fiscalia, spreadsheet, config_tab)
+        delitos_graves = list(dict.fromkeys(delitos_satje + delitos_fisc))   # dedupe preservando orden
+        if delitos_graves:
+            # Indicar fuente en el mensaje
+            fuente = []
+            if es_grave_satje: fuente.append("SATJE")
+            if es_grave_fisc:  fuente.append("Fiscalía")
             resultado.setdefault("alertas", []).insert(
-                0, f"🚨 DELITOS GRAVES: {', '.join(delitos_graves)}"
+                0, f"🚨 DELITOS GRAVES ({'/'.join(fuente)}): {', '.join(delitos_graves)}"
             )
             _enviar_alerta_telegram(nombre, cedula, delitos_graves)
 

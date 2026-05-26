@@ -92,17 +92,18 @@ HEADERS_CANDIDATOS = [
     "Razón Veredicto",           # G
     "🎓 Bachiller (Min. Educ.)", # H  ← oficial MinEdu
     "⚖️ Procesos Judiciales",    # I  ← SATJE
-    "🎖️ Certificaciones MDT",   # J  ← SETEC (Min. Trabajo) ← junto a las otras
-    "Educación (CV)",            # K
-    "Años Exp.",                 # L
-    "Experiencia",               # M
-    "Disponibilidad",            # N
-    "Movilidad",                 # O
-    "Resumen",                   # P
-    "⭐ Potencial",              # Q
-    "Preguntas Entrevista",      # R
-    "Alertas",                   # S
-    "📎 CV",                     # T  ← archivo al final
+    "🎖️ Certificaciones MDT",   # J  ← SETEC (Min. Trabajo)
+    "🚨 Noticias Delito",        # K  ← Fiscalía SIAF (v5.7+) junto a otras verificaciones
+    "Educación (CV)",            # L
+    "Años Exp.",                 # M
+    "Experiencia",               # N
+    "Disponibilidad",            # O
+    "Movilidad",                 # P
+    "Resumen",                   # Q
+    "⭐ Potencial",              # R
+    "Preguntas Entrevista",      # S
+    "Alertas",                   # T
+    "📎 CV",                     # U  ← archivo al final
 ]
 
 ANCHOS_COLUMNAS = [
@@ -116,30 +117,32 @@ ANCHOS_COLUMNAS = [
     260,  # H  Bachiller (Min. Educ.) (wrap)
     280,  # I  Procesos Judiciales (wrap)
     320,  # J  🎖️ Certificaciones MDT (wrap, listas largas)
-    240,  # K  Educación CV (wrap)
-     75,  # L  Años Exp.
-    280,  # M  Experiencia (wrap)
-    170,  # N  Disponibilidad (wrap)
-     85,  # O  Movilidad
-    320,  # P  Resumen (wrap)
-    280,  # Q  ⭐ Potencial (wrap)
-    320,  # R  Preguntas Entrevista (wrap)
-    240,  # S  Alertas (wrap)
-     80,  # T  📎 CV (hyperlink)
+    280,  # K  🚨 Noticias Delito (wrap, lista delitos)
+    240,  # L  Educación CV (wrap)
+     75,  # M  Años Exp.
+    280,  # N  Experiencia (wrap)
+    170,  # O  Disponibilidad (wrap)
+     85,  # P  Movilidad
+    320,  # Q  Resumen (wrap)
+    280,  # R  ⭐ Potencial (wrap)
+    320,  # S  Preguntas Entrevista (wrap)
+    240,  # T  Alertas (wrap)
+     80,  # U  📎 CV (hyperlink)
 ]
 
-# Índices basados en 0
-COLS_WRAP   = [6, 7, 8, 9, 10, 12, 13, 15, 16, 17, 18]   # G, H, I, J, K, M, N, P, Q, R, S
-COLS_CENTER = [5, 11, 14, 19]                             # F, L, O, T
+# Índices basados en 0 (shift +1 por inserción de Fiscalía en K)
+COLS_WRAP   = [6, 7, 8, 9, 10, 11, 13, 14, 16, 17, 18, 19]   # G, H, I, J, K, L, N, O, Q, R, S, T
+COLS_CENTER = [5, 12, 15, 20]                                 # F, M, P, U
 
-NUM_COLS = len(HEADERS_CANDIDATOS)        # 20
-COL_FIN  = chr(ord("A") + NUM_COLS - 1)   # "T"
+NUM_COLS = len(HEADERS_CANDIDATOS)        # 21
+COL_FIN  = chr(ord("A") + NUM_COLS - 1)   # "U"
 
 # Índices clave (basados en 0)
 IDX_SEMAFORO     = 5    # F
 IDX_SETEC        = 9    # J  ← junto a verificaciones oficiales
-IDX_POTENCIAL    = 16   # Q  ← shift +1
-IDX_CV_LINK      = 19   # T  ← shift +1, archivo al final
+IDX_FISCALIA     = 10   # K  ← Fiscalía SIAF (v5.7+)
+IDX_POTENCIAL    = 17   # R  ← shift +1 por Fiscalía
+IDX_CV_LINK      = 20   # U  ← shift +1 por Fiscalía, archivo al final
 
 # ── Logs: 7 columnas (A–G) ─ v5.6: agregada columna Vacante ─────────────────
 HEADERS_LOGS  = ["Fecha/Hora", "Nivel", "Evento", "Detalle", "IA Utilizada", "Costo USD", "Vacante"]
@@ -1050,7 +1053,7 @@ def escribir_candidato(spreadsheet, resultado: dict, metadata: dict = None,
     nota_talento   = resultado.get("nota_talento") or ""
     disponibilidad = _formatear_disponibilidad(metadata)
 
-    # Estructura de 20 columnas (v5.3.1: SETEC en J junto a verificaciones, CV al final en T)
+    # Estructura de 21 columnas (v5.7: Fiscalía en K junto a verificaciones, CV al final en U)
     fila = [
         _ahora(),                                          # A  Fecha/Hora
         nombre,                                            # B  Nombre
@@ -1062,16 +1065,17 @@ def escribir_candidato(spreadsheet, resultado: dict, metadata: dict = None,
         resultado.get("bachiller_oficial_resumen", "—"),   # H  🎓 Bachiller MinEdu
         resultado.get("satje_resumen", "—"),               # I  ⚖️ Procesos Judiciales
         resultado.get("setec_resumen", "—"),               # J  🎖️ Certificaciones MDT
-        resultado.get("detalle_educacion", ""),            # K  Educación (CV)
-        resultado.get("anios_experiencia", 0),             # L  Años Exp.
-        resultado.get("experiencia_detalle", ""),          # M  Experiencia
-        disponibilidad,                                    # N  Disponibilidad
-        movilidad_str,                                     # O  Movilidad
-        resultado.get("resumen", ""),                      # P  Resumen
-        nota_talento,                                      # Q  ⭐ Potencial
-        preguntas,                                         # R  Preguntas Entrevista
-        alertas,                                           # S  Alertas
-        drive_link,                                        # T  📎 CV (se reemplaza por hyperlink)
+        resultado.get("fiscalia_resumen", "—"),            # K  🚨 Noticias Delito (Fiscalía SIAF)
+        resultado.get("detalle_educacion", ""),            # L  Educación (CV)
+        resultado.get("anios_experiencia", 0),             # M  Años Exp.
+        resultado.get("experiencia_detalle", ""),          # N  Experiencia
+        disponibilidad,                                    # O  Disponibilidad
+        movilidad_str,                                     # P  Movilidad
+        resultado.get("resumen", ""),                      # Q  Resumen
+        nota_talento,                                      # R  ⭐ Potencial
+        preguntas,                                         # S  Preguntas Entrevista
+        alertas,                                           # T  Alertas
+        drive_link,                                        # U  📎 CV (se reemplaza por hyperlink)
     ]
 
     # ── Sección crítica: encabezado + append + número de fila ────────────────
